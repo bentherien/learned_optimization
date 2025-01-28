@@ -160,6 +160,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
       steps_per_jit=10,
       stack_antithetic_samples: bool = False,
       sign_delta_loss_scalar: Optional[float] = None,
+      trunc_schedule = None,
   ):
     self.truncated_step = truncated_step
     self.std = std
@@ -168,6 +169,8 @@ class TruncatedPES(gradient_learner.GradientEstimator):
     self.steps_per_jit = steps_per_jit
     self.stack_antithetic_samples = stack_antithetic_samples
     self.sign_delta_loss_scalar = sign_delta_loss_scalar
+    self.trunc_schedule = trunc_schedule
+    self.update_truncation_length(0)
 
     if self.trunc_length % self.steps_per_jit != 0:
       raise ValueError("Pass a trunc_length and steps_per_jit that are"
@@ -193,6 +196,11 @@ class TruncatedPES(gradient_learner.GradientEstimator):
         pos_state=pos_unroll_state,
         neg_state=neg_unroll_state,
         accumulator=accumulator)
+
+  def update_truncation_length(self, iteration):
+    if self.trunc_schedule is not None:
+      self.trunc_length = self.trunc_schedule(iteration)
+      # print(f"update_truncation_length() trunc_length={self.trunc_length}")
 
   @profile.wrap()
   def get_datas(self):
