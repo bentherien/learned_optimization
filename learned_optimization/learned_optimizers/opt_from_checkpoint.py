@@ -146,7 +146,17 @@ def opt_from_checkpoint(
           theta = lopt.init(jax.random.PRNGKey(0))
           logging.info(f"Restoring checkpoint {checkpoint_path}")  # pylint: disable=logging-fstring-interpolation
           ckpt = gradient_learner.ParameterCheckpoint(theta, "", 0)
+
+          print("[opt_from_checkpoint] checkpoint_path", checkpoint_path, ckpt.__dict__.keys())
           ckpt = checkpoints.load_state(checkpoint_path, ckpt)
+          print("[opt_from_checkpoint] checkpoint_path after ckpt=", checkpoint_path, ckpt.__dict__.keys())
+
+          # checkpoints.save_checkpoint(ckpt_dir='.',
+          #               prefix='velo_',
+          #               value=ckpt,
+          #               step=0,
+          #               keep= 20)
+
           opt = lopt.opt_fn(ckpt.params)
           wrapped = _GinScopeClass(opt, scope)
           # For now, just add the lopt to the returned class.

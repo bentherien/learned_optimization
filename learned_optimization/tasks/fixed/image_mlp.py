@@ -31,7 +31,8 @@ import numpy as onp
 Params = Any
 ModelState = Any
 PRNGKey = jnp.ndarray
-
+State = Any
+Batch = Any
 
 
 class MLP(hk.Module):
@@ -242,6 +243,12 @@ class _MLPImageTask(base.Task):
     accuracy = jnp.mean(correct_predictions.astype(jnp.float32))
     
     return loss, accuracy
+
+  @functools.partial(jax.jit, static_argnums=(0,))
+  def loss_and_accuracy_with_state(self, params: Params, state: State, key: PRNGKey, data: Any) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    loss, accuracy = self.loss_and_accuracy(params, key, data)
+    return loss, accuracy
+
 
   def normalizer(self, loss):
     num_classes = self.datasets.extra_info["num_classes"]
