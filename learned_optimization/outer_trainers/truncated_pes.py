@@ -45,7 +45,232 @@ class PESWorkerState(gradient_learner.GradientEstimatorState):
   accumulator: MetaParams
 
 
-@functools.partial(jax.jit, static_argnames=("std", "sign_delta_loss_scalar"))
+# @functools.partial(jax.jit, static_argnames=("std", "sign_delta_loss_scalar"))
+def compute_pes_grad_pmap(
+    p_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
+    n_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
+    accumulator: MetaParams,
+    vec_pos: MetaParams,
+    std: float,
+    sign_delta_loss_scalar: Optional[float] = None,
+    samples_per_device: int = 1,
+    device_idx: int = 0,
+) -> Tuple[float, MetaParams, MetaParams, truncated_step_mod.TruncatedUnrollOut,
+           float]:
+  """Compute the PES gradient estimate from the outputs of many unrolls.
+
+  Args:
+    p_yses: Sequence of PES outputs from the positive perturbation.
+    n_yses: Sequence of PES outputs from the negative perturbation.
+    accumulator: Current PES accumulator from the last iteration.
+    vec_pos: Positive perturbations used to compute the current unroll.
+    std: Standard deviation of pertrubations used.
+    sign_delta_loss_scalar: Optional, if specified the sign of the delta loss
+      multiplied by this value is used instead of the real delta_loss
+
+  Returns:
+    loss: the mean loss.
+    es_grad: the grad estimate.
+    new_accumulator: the new accumulator value.
+    delta_loss: the difference in positive and negative losses.
+
+  """
+  def allgather_pytree(pytree, axis=0):
+    """
+    Perform an all-gather operation on all leaf tensors in the pytree.
+    The tensors are stacked along dimension 0.
+    """
+    return jax.tree_map(lambda x: jax.lax.all_gather(x, 'devices', axis=axis), pytree)
+
+  def reshape_first_three_dims(x):
+    # Get shape and reshape to combine first two dims
+    shape = x.shape
+    return x.reshape([shape[0] * shape[1] * shape[2]] + list(shape[3:]))
+
+  def reshape_last_two_dims(x):
+    # Get shape and reshape to combine first two dims
+    shape = x.shape
+    return x.reshape(list(shape[:1]) + [shape[1] * shape[2]] )
+
+
+
+
+
+  # Only print on rank 0
+  # if jax.process_index() == 0:
+  #   print("="*100)
+  #   print("Before AR")
+  #   print("="*100)
+  #   print("p_yses shapes:", jax.tree_util.tree_map(lambda x: x.shape, p_yses))
+  #   print("n_yses shapes:", jax.tree_util.tree_map(lambda x: x.shape, n_yses))
+  #   print("accumulator shapes:", jax.tree_util.tree_map(lambda x: x.shape, accumulator))
+  #   print("vec_pos shapes:", jax.tree_util.tree_map(lambda x: x.shape, vec_pos))
+  #   print("="*100)
+  #   print("After AR")
+  #   print("="*100)
+
+  p_yses = jax.pmap(functools.partial(allgather_pytree, axis=1), axis_name='devices')(p_yses)
+  n_yses = jax.pmap(functools.partial(allgather_pytree, axis=1), axis_name='devices')(n_yses)
+
+  p_yses = jax.tree_map(reshape_last_two_dims, p_yses)
+  n_yses = jax.tree_map(reshape_last_two_dims, n_yses)
+
+  # if jax.process_index() == 0:
+  #   print("p_yses shapes:", jax.tree_util.tree_map(lambda x: x.shape, p_yses))
+  #   print("n_yses shapes:", jax.tree_util.tree_map(lambda x: x.shape, n_yses))
+
+  accumulator = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0), accumulator)
+  vec_pos = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0), vec_pos)
+
+  accumulator = jax.pmap(functools.partial(allgather_pytree, axis=0), axis_name='devices')(accumulator)
+  vec_pos = jax.pmap(functools.partial(allgather_pytree, axis=0), axis_name='devices')(vec_pos)
+
+  accumulator = jax.tree_map(reshape_first_three_dims, accumulator)
+  vec_pos = jax.tree_map(reshape_first_three_dims, vec_pos)
+
+  # # Only print on rank 0
+  # if jax.process_index() == 0:
+  #   print("accumulator shapes:", jax.tree_util.tree_map(lambda x: x.shape, accumulator))
+  #   print("vec_pos shapes:", jax.tree_util.tree_map(lambda x: x.shape, vec_pos))
+
+  # # import pdb; pdb.set_trace()
+  # exit(0)
+
+  def flat_first(x):
+    return x.reshape([x.shape[0] * x.shape[1]] + list(x.shape[2:]))
+  
+  #Flatten tensorse
+  p_ys = jax.tree_util.tree_map(flat_first, tree_utils.tree_zip_jnp(p_yses))
+  n_ys = jax.tree_util.tree_map(flat_first, tree_utils.tree_zip_jnp(n_yses))
+
+  #get the direction (L(\theta + \eps) - L(\theta - \eps))
+  delta_losses = p_ys.loss - n_ys.loss
+
+  if sign_delta_loss_scalar:
+    # With PES, there is no single loss for a truncation. For the particular
+    # perturbation we will estimate the sign by first averaging.
+    sign_per_task = jnp.sign(jnp.mean(delta_losses * p_ys.mask, axis=0))
+    delta_losses = jnp.ones_like(
+        delta_losses) * sign_per_task * sign_delta_loss_scalar
+
+
+  has_finished = lax.cumsum(jnp.asarray(p_ys.is_done, dtype=jnp.int32)) > 0
+
+  # p_ys is of the form [sequence, n_tasks]
+  denom = jnp.sum(p_ys.mask, axis=0)
+
+  last_unroll_loss = jnp.sum(
+      delta_losses * (1.0 - has_finished) * p_ys.mask, axis=0) / denom
+
+  new_unroll_loss = jnp.sum(
+      delta_losses * has_finished * p_ys.mask, axis=0) / denom
+
+  factor = 1.0 / (2 * std**2)
+
+  accumulator = tree_utils.tree_add(vec_pos, accumulator)
+
+  num_tasks = last_unroll_loss.shape[0]
+
+  def reshape_to(loss, p):
+    return loss.reshape((num_tasks,) + (1,) * (len(p.shape) - 1)) * factor * p
+
+  es_grad_from_accum = jax.tree_util.tree_map(
+      functools.partial(reshape_to, last_unroll_loss), accumulator)
+
+  es_grad_from_new_perturb = jax.tree_util.tree_map(
+      functools.partial(reshape_to, new_unroll_loss), vec_pos)
+
+  vec_es_grad = jax.tree_util.tree_map(lambda a, b: a + b, es_grad_from_accum,
+                                       es_grad_from_new_perturb)
+
+  es_grad = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), vec_es_grad)
+
+  def _switch_one_accum(a, b):
+    shape = [num_tasks] + [1] * (len(a.shape) - 1)
+    return jnp.where(jnp.reshape(has_finished[-1], shape), a, b)
+
+  new_accumulator = jax.tree_util.tree_map(_switch_one_accum, vec_pos,
+                                           accumulator)
+
+  pos_loss = jnp.sum(p_ys.loss * p_ys.mask, axis=0) / jnp.sum(p_ys.mask, axis=0)
+  neg_loss = jnp.sum(n_ys.loss * n_ys.mask, axis=0) / jnp.sum(n_ys.mask, axis=0)
+
+  # if jax.process_index() == 0:
+  #   print("="*100)
+  #   print("before output")
+  #   print("="*100)
+  #   print("pos_loss shape:", pos_loss.shape)
+  #   print("neg_loss shape:", neg_loss.shape)
+  #   print("es_grad shape:", jax.tree_map(lambda x: x.shape, es_grad))
+  #   print("new_accumulator shape:", jax.tree_map(lambda x: x.shape, new_accumulator))
+  #   print("p_ys shape:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else None, p_ys))
+  #   print("delta_losses shape:", delta_losses.shape)
+
+
+  #   pos_loss shape: (2,)
+  # neg_loss shape: (2,)
+  # es_grad shape: {'adafactor_decays': (3,), 'momentum_decays': (3,), 'nn': {'~': {'b0': (32,), 'b1': (32,), 'b2': (2,), 'w0': (39, 32), 'w1': (32, 32), 'w2': (32, 2)}}, 'rms_decays': (1,)}
+  # new_accumulator shape: {'adafactor_decays': (2, 3), 'momentum_decays': (2, 3), 'nn': {'~': {'b0': (2, 32), 'b1': (2, 32), 'b2': (2, 2), 'w0': (2, 39, 32), 'w1': (2, 32, 32), 'w2': (2, 32, 2)}}, 'rms_decays': (2, 1)}
+  # p_ys shape: TruncatedUnrollOut(loss=(50, 2), is_done=(50, 2), task_param=(50, 2), iteration=(50, 2), mask=(50, 2))
+  # delta_losses shape: (50, 2)
+  # Get current device index and total number of devices
+  # device_idx = jax.process_index()
+  # num_devices = jax.device_count()
+
+  # Calculate samples per device (total samples = 2)
+  # samples_per_device = 2 // num_devices
+
+  # Get slice indices for current device
+  start_idx = device_idx * samples_per_device
+  end_idx = start_idx + samples_per_device
+
+  # Slice outputs to keep only samples for current device
+  # pos_loss = pos_loss[start_idx:end_idx]
+  # neg_loss = neg_loss[start_idx:end_idx]
+  
+  # Helper function to slice pytrees
+  def slice_first_dim(x):
+    if hasattr(x, 'shape'):
+      return x[start_idx:end_idx]
+    return x
+
+  # Slice pytree outputs
+  new_accumulator = jax.tree_map(slice_first_dim, new_accumulator)
+  p_ys = jax.tree_map(lambda x: x[:, start_idx:end_idx] if hasattr(x, 'shape') else x, p_ys)
+  delta_losses = delta_losses[:, start_idx:end_idx]
+
+
+  # print("pos_loss shape:", pos_loss.shape)
+  # print("neg_loss shape:", neg_loss.shape)
+  # print("es_grad shape:", jax.tree_map(lambda x: x.shape, es_grad))
+  # print("new_accumulator shape:", jax.tree_map(lambda x: x.shape, new_accumulator))
+  # print("p_ys shape:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else None, p_ys))
+  # print("delta_losses shape:", delta_losses.shape)
+  # exit(0)
+  # if jax.process_index() == 0:
+  #   print("="*100)
+  #   print("after output")
+  #   print("="*100)
+  #   print("start_idx, end_idx:", start_idx, end_idx, "samples_per_device:", samples_per_device, "device_idx:", device_idx)
+  #   print("pos_loss shape:", pos_loss.shape)
+  #   print("neg_loss shape:", neg_loss.shape)
+  #   print("es_grad shape:", jax.tree_map(lambda x: x.shape, es_grad))
+  #   print("new_accumulator shape:", jax.tree_map(lambda x: x.shape, new_accumulator))
+  #   print("p_ys shape:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else None, p_ys))
+  #   print("delta_losses shape:", delta_losses.shape)
+
+
+  return (
+      jnp.mean((pos_loss + neg_loss) / 2.0),
+      es_grad,
+      new_accumulator,
+      p_ys,
+      delta_losses,
+  )  # pytype: disable=bad-return-type
+
+
+
+@functools.partial(jax.jit, static_argnames=("std", "sign_delta_loss_scalar", "samples_per_device", "device_idx"))
 def compute_pes_grad(
     p_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
     n_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
@@ -53,6 +278,8 @@ def compute_pes_grad(
     vec_pos: MetaParams,
     std: float,
     sign_delta_loss_scalar: Optional[float] = None,
+    samples_per_device: Optional[int] = None,
+    device_idx: Optional[int] = None,
 ) -> Tuple[float, MetaParams, MetaParams, truncated_step_mod.TruncatedUnrollOut,
            float]:
   """Compute the PES gradient estimate from the outputs of many unrolls.
@@ -138,7 +365,6 @@ def compute_pes_grad(
       delta_losses,
   )  # pytype: disable=bad-return-type
 
-
 @gin.configurable
 class TruncatedPES(gradient_learner.GradientEstimator):
   """GradientEstimator for computing PES gradient estimates.
@@ -161,6 +387,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
       stack_antithetic_samples: bool = False,
       sign_delta_loss_scalar: Optional[float] = None,
       trunc_schedule = None,
+      pmap_across_devices: bool = False,
   ):
     self.truncated_step = truncated_step
     self.std = std
@@ -171,6 +398,8 @@ class TruncatedPES(gradient_learner.GradientEstimator):
     self.sign_delta_loss_scalar = sign_delta_loss_scalar
     self.trunc_schedule = trunc_schedule
     self.update_truncation_length(0)
+    self.samples_per_device = self.truncated_step.num_tasks
+    self.grad_fn = compute_pes_grad_pmap if pmap_across_devices else compute_pes_grad
 
     if self.trunc_length % self.steps_per_jit != 0:
       raise ValueError("Pass a trunc_length and steps_per_jit that are"
@@ -268,13 +497,15 @@ class TruncatedPES(gradient_learner.GradientEstimator):
       p_yses.append(p_ys)
       n_yses.append(n_ys)
 
-    loss, es_grad, new_accumulator, p_ys, delta_loss = compute_pes_grad(
+    loss, es_grad, new_accumulator, p_ys, delta_loss = self.grad_fn(
         p_yses,
         n_yses,
         accumulator,
         vec_pos,
         self.std,
-        sign_delta_loss_scalar=self.sign_delta_loss_scalar)
+        sign_delta_loss_scalar=self.sign_delta_loss_scalar,
+        samples_per_device=self.samples_per_device,
+        device_idx=jax.process_index())
 
     unroll_info = gradient_learner.UnrollInfo(
         loss=p_ys.loss,
@@ -291,9 +522,9 @@ class TruncatedPES(gradient_learner.GradientEstimator):
     metrics = summary.aggregate_metric_list(
         metrics, use_jnp=jax_utils.in_jit(), key=next(rng))
     if with_summary:
-      metrics["sample||delta_loss_sample"] = summary.sample_value(
-          key, jnp.abs(delta_loss))
-      metrics["mean||delta_loss_mean"] = jnp.abs(delta_loss)
+      # metrics["sample||delta_loss_sample"] = summary.sample_value(
+      #     key, jnp.abs(delta_loss))
+      # metrics["mean||delta_loss_mean"] = jnp.abs(delta_loss)
       if hasattr(p_state, "inner_step"):
         metrics["sample||inner_step"] = p_state.inner_step[0]
         metrics["sample||end_inner_step"] = p_state.inner_step[0]
