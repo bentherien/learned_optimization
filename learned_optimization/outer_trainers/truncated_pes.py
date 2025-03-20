@@ -52,6 +52,7 @@ def compute_pes_grad_pmap(
     accumulator: MetaParams,
     vec_pos: MetaParams,
     std: float,
+    timer_obj: Any,
     sign_delta_loss_scalar: Optional[float] = None,
     samples_per_device: int = 1,
     device_idx: int = 0,
@@ -108,25 +109,25 @@ def compute_pes_grad_pmap(
   #   print("="*100)
   #   print("After AR")
   #   print("="*100)
+  with timer_obj("PES Gather", []):
+    p_yses = jax.pmap(functools.partial(allgather_pytree, axis=1), axis_name='devices')(p_yses)
+    n_yses = jax.pmap(functools.partial(allgather_pytree, axis=1), axis_name='devices')(n_yses)
 
-  p_yses = jax.pmap(functools.partial(allgather_pytree, axis=1), axis_name='devices')(p_yses)
-  n_yses = jax.pmap(functools.partial(allgather_pytree, axis=1), axis_name='devices')(n_yses)
+    p_yses = jax.tree_map(reshape_last_two_dims, p_yses)
+    n_yses = jax.tree_map(reshape_last_two_dims, n_yses)
 
-  p_yses = jax.tree_map(reshape_last_two_dims, p_yses)
-  n_yses = jax.tree_map(reshape_last_two_dims, n_yses)
+    # if jax.process_index() == 0:
+    #   print("p_yses shapes:", jax.tree_util.tree_map(lambda x: x.shape, p_yses))
+    #   print("n_yses shapes:", jax.tree_util.tree_map(lambda x: x.shape, n_yses))
 
-  # if jax.process_index() == 0:
-  #   print("p_yses shapes:", jax.tree_util.tree_map(lambda x: x.shape, p_yses))
-  #   print("n_yses shapes:", jax.tree_util.tree_map(lambda x: x.shape, n_yses))
+    accumulator = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0), accumulator)
+    vec_pos = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0), vec_pos)
 
-  accumulator = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0), accumulator)
-  vec_pos = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0), vec_pos)
+    accumulator = jax.pmap(functools.partial(allgather_pytree, axis=0), axis_name='devices')(accumulator)
+    vec_pos = jax.pmap(functools.partial(allgather_pytree, axis=0), axis_name='devices')(vec_pos)
 
-  accumulator = jax.pmap(functools.partial(allgather_pytree, axis=0), axis_name='devices')(accumulator)
-  vec_pos = jax.pmap(functools.partial(allgather_pytree, axis=0), axis_name='devices')(vec_pos)
-
-  accumulator = jax.tree_map(reshape_first_three_dims, accumulator)
-  vec_pos = jax.tree_map(reshape_first_three_dims, vec_pos)
+    accumulator = jax.tree_map(reshape_first_three_dims, accumulator)
+    vec_pos = jax.tree_map(reshape_first_three_dims, vec_pos)
 
   # # Only print on rank 0
   # if jax.process_index() == 0:
@@ -270,13 +271,14 @@ def compute_pes_grad_pmap(
 
 
 
-@functools.partial(jax.jit, static_argnames=("std", "sign_delta_loss_scalar", "samples_per_device", "device_idx"))
+@functools.partial(jax.jit, static_argnames=("std", "timer_obj", "sign_delta_loss_scalar", "samples_per_device", "device_idx"))
 def compute_pes_grad(
     p_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
     n_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
     accumulator: MetaParams,
     vec_pos: MetaParams,
     std: float,
+    timer_obj: Any,
     sign_delta_loss_scalar: Optional[float] = None,
     samples_per_device: Optional[int] = None,
     device_idx: Optional[int] = None,
@@ -303,6 +305,11 @@ def compute_pes_grad(
 
   def flat_first(x):
     return x.reshape([x.shape[0] * x.shape[1]] + list(x.shape[2:]))
+
+
+  
+  with timer_obj("PES Gather", []):
+    pass
 
   p_ys = jax.tree_util.tree_map(flat_first, tree_utils.tree_zip_jnp(p_yses))
   n_ys = jax.tree_util.tree_map(flat_first, tree_utils.tree_zip_jnp(n_yses))
@@ -388,6 +395,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
       sign_delta_loss_scalar: Optional[float] = None,
       trunc_schedule = None,
       pmap_across_devices: bool = False,
+      timer_obj: Any = None,
   ):
     self.truncated_step = truncated_step
     self.std = std
@@ -400,6 +408,9 @@ class TruncatedPES(gradient_learner.GradientEstimator):
     self.update_truncation_length(0)
     self.samples_per_device = self.truncated_step.num_tasks
     self.grad_fn = compute_pes_grad_pmap if pmap_across_devices else compute_pes_grad
+    self.timer_obj = timer_obj
+
+    assert self.timer_obj is not None, "timer_obj must be provided"
 
     if self.trunc_length % self.steps_per_jit != 0:
       raise ValueError("Pass a trunc_length and steps_per_jit that are"
@@ -503,6 +514,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
         accumulator,
         vec_pos,
         self.std,
+        self.timer_obj,
         sign_delta_loss_scalar=self.sign_delta_loss_scalar,
         samples_per_device=self.samples_per_device,
         device_idx=jax.process_index())
