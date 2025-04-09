@@ -396,6 +396,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
       trunc_schedule = None,
       pmap_across_devices: bool = False,
       timer_obj: Any = None,
+      use_bc_grads: bool = False,
   ):
     self.truncated_step = truncated_step
     self.std = std
@@ -409,7 +410,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
     self.samples_per_device = self.truncated_step.num_tasks
     self.grad_fn = compute_pes_grad_pmap if pmap_across_devices else compute_pes_grad
     self.timer_obj = timer_obj
-
+    self.use_bc_grads = use_bc_grads
     assert self.timer_obj is not None, "timer_obj must be provided"
 
     if self.trunc_length % self.steps_per_jit != 0:
@@ -470,6 +471,8 @@ class TruncatedPES(gradient_learner.GradientEstimator):
 
     p_yses = []
     n_yses = []
+    p_bc_grads_list = []
+    n_bc_grads_list = []
     metrics = []
 
     # TODO(lmetz) consider switching this to be a jax.lax.scan when inside jit.
@@ -488,9 +491,11 @@ class TruncatedPES(gradient_learner.GradientEstimator):
       n_state = jax.tree_util.tree_map(lambda x: jnp.asarray(x, dtype=x.dtype),
                                        n_state)
 
+                  
+
       key = next(rng)
 
-      p_state, n_state, p_ys, n_ys, m = common.maybe_stacked_es_unroll(
+      p_state, n_state, p_ys, n_ys, p_bc_grads, n_bc_grads, m = common.maybe_stacked_es_unroll(
           self.truncated_step,
           self.steps_per_jit,
           self.stack_antithetic_samples,
@@ -507,6 +512,30 @@ class TruncatedPES(gradient_learner.GradientEstimator):
       metrics.append(m)
       p_yses.append(p_ys)
       n_yses.append(n_ys)
+      
+      p_bc_grads_list.append(p_bc_grads)
+      n_bc_grads_list.append(n_bc_grads)
+
+
+
+    if self.use_bc_grads:
+      # Convert lists of gradients to stacked arrays
+      stacked_bc_grads = jax.tree_util.tree_map(
+          lambda *xs: jnp.stack(xs),
+          *(p_bc_grads_list + n_bc_grads_list)
+      )
+      # print(jax.tree_map(lambda x: x.shape, stacked_bc_grads))
+      
+      # Take the mean along the first two dimensions
+      mean_bc_grads = jax.tree_util.tree_map(
+          lambda x: jnp.mean(x, axis=(0, 1, 2)),
+          stacked_bc_grads
+      )
+      # print(jax.tree_map(lambda x: x.shape, mean_bc_grads))
+      # exit(0)
+    else:
+      mean_bc_grads = None
+
 
     loss, es_grad, new_accumulator, p_ys, delta_loss = self.grad_fn(
         p_yses,
@@ -528,6 +557,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
     output = gradient_learner.GradientEstimatorOut(
         mean_loss=loss,
         grad=es_grad,
+        bc_grad=mean_bc_grads,
         unroll_state=PESWorkerState(p_state, n_state, new_accumulator),
         unroll_info=unroll_info)
 

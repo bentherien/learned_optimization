@@ -129,8 +129,8 @@ class MLP(hk.Module):
           hk.set_state("layer_%d_act" % i, out)
       else:
         if self.log_activations:
-          hk.set_state("layer_%d_logits_l1" % i, jnp.mean(jnp.abs(out * self.output_mul)))
-          hk.set_state("layer_%d_logits" % i, out * self.output_mul)
+          hk.set_state("layer_%d_logits_l1" % i, jnp.mean(jnp.abs(out)))
+          hk.set_state("layer_%d_logits" % i, out )
 
     return out
 
@@ -212,16 +212,35 @@ class _MLPImageTask(base.Task):
           sizes, activation=act_fn, log_activations=log_activations)(
               inp, dropout_rate=dropout_rate, rng=hk.next_rng_key())
 
-    self._mod = hk.transform(_forward)
+    # if log_activations:
+    self._mod = hk.transform_with_state(_forward)
+    # else:
+    #   self._mod = hk.transform(_forward)
 
   def init(self, key: PRNGKey) -> Any:
     batch = jax.tree_util.tree_map(lambda x: jnp.ones(x.shape, x.dtype),
                                    self.datasets.abstract_batch)
-    return self._mod.init(key, batch["image"])
+    params, state = self._mod.init(key, batch["image"])
+    return params, state
+
+  
+  def init_with_state(self, key: PRNGKey) -> base.Params:
+    batch = jax.tree_util.tree_map(lambda x: jnp.ones(x.shape, x.dtype),
+                                   self.datasets.abstract_batch)
+    params, state = self._mod.init(key, batch["image"])
+    return params, state
+
+
+  def loss_with_state(self, params, state, key, data):
+    num_classes = self.datasets.extra_info["num_classes"]
+    logits, state = self._mod.apply(params, state, key, data["image"])
+    labels = jax.nn.one_hot(data["label"], num_classes)
+    vec_loss = base.softmax_cross_entropy(logits=logits, labels=labels)
+    return jnp.mean(vec_loss), state
 
   def loss(self, params: Params, key: PRNGKey, data: Any) -> jnp.ndarray:  # pytype: disable=signature-mismatch  # jax-ndarray
     num_classes = self.datasets.extra_info["num_classes"]
-    logits = self._mod.apply(params, key, data["image"])
+    logits, _ = self._mod.apply(params, key, data["image"])
     labels = jax.nn.one_hot(data["label"], num_classes)
     vec_loss = base.softmax_cross_entropy(logits=logits, labels=labels)
     return jnp.mean(vec_loss)
@@ -229,7 +248,7 @@ class _MLPImageTask(base.Task):
   @functools.partial(jax.jit, static_argnums=(0,))
   def loss_and_accuracy(self, params: Params, key: PRNGKey, data: Any) -> Tuple[jnp.ndarray, jnp.ndarray]:
     num_classes = self.datasets.extra_info["num_classes"]
-    logits = self._mod.apply(params, key, data["image"])[0]
+    logits, _ = self._mod.apply(params, key, data["image"])[0]
     
     # Calculate the loss as before
     labels = jax.nn.one_hot(data["label"], num_classes)
@@ -246,7 +265,20 @@ class _MLPImageTask(base.Task):
 
   @functools.partial(jax.jit, static_argnums=(0,))
   def loss_and_accuracy_with_state(self, params: Params, state: State, key: PRNGKey, data: Any) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    loss, accuracy = self.loss_and_accuracy(params, key, data)
+    num_classes = self.datasets.extra_info["num_classes"]
+    logits, state = self._mod.apply(params, state, key, data["image"])
+    
+    # Calculate the loss as before
+    labels = jax.nn.one_hot(data["label"], num_classes)
+    vec_loss = base.softmax_cross_entropy(logits=logits, labels=labels)
+    loss = jnp.mean(vec_loss)
+    
+    # Calculate the accuracy
+    predictions = jnp.argmax(logits, axis=-1)
+    actual = data["label"]
+    correct_predictions = predictions == actual
+    accuracy = jnp.mean(correct_predictions.astype(jnp.float32))
+    
     return loss, accuracy
 
 

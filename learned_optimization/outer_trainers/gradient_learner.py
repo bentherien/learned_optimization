@@ -91,6 +91,7 @@ class UnrollInfo:
 class GradientEstimatorOut:
   mean_loss: jnp.ndarray
   grad: Any
+  bc_grad: Optional[Any]
   unroll_state: GradientEstimatorState
   unroll_info: Optional[UnrollInfo]
 
