@@ -246,8 +246,11 @@ def progress_or_reset_inner_opt_state(
 
     next_inner_opt_state = opt.init(p, s, num_steps=num_steps, key=key3)
     # summary.summary("opt_init_num_steps", num_steps)  # pytype: disable=wrong-arg-types  # jax-ndarray
-    bc_grad = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), opt.theta)
-    bc_grad['bc_loss'] = jnp.array(0.0)
+    if use_bc_grads:
+      bc_grad = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), opt.theta)
+      bc_grad['bc_loss'] = jnp.array(0.0)
+    else:
+      bc_grad = jnp.array(0.0)
 
     return next_inner_opt_state, task_param, jnp.asarray(0), jnp.asarray(0.), bc_grad
 
