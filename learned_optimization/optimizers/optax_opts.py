@@ -61,6 +61,19 @@ class OptaxOptimizer(base.Optimizer):
         state=model_state,
         iteration=0,
     )
+  
+  @functools.partial(jax.jit, static_argnums=(0,))
+  def resume_init(self,
+          opt_state: OptaxState,
+          params: Params,
+          model_state: Optional[ModelState] = None,
+          key: Optional[chex.PRNGKey] = None):
+    return OptaxState(  # pytype: disable=wrong-arg-types  # jax-ndarray
+        state=model_state,
+        params=params,
+        optax_opt_state=opt_state.optax_opt_state,
+        iteration=opt_state.iteration,
+    )
 
   @functools.partial(jax.jit, static_argnums=(0,))
   def update(self,
@@ -275,6 +288,44 @@ class Fromage(OptaxOptimizer):
     opt = optax.fromage(learning_rate, min_norm)
     super().__init__(opt)
 
+@gin.configurable
+class Muon(OptaxOptimizer):
+  """Muon optimizer."""
+
+  def __init__(
+      self,
+      learning_rate,
+      ns_coeffs: Union[
+          tuple[float, float, float],
+          tuple[tuple[float, float, float], ...],
+      ] = (3.4445, -4.7750, 2.0315),
+      ns_steps: int = 5,
+      beta: float = 0.95,
+      eps: float = 1e-8,
+      mu_dtype: Optional[chex.ArrayDType] = None,
+      nesterov: bool = True,
+      adaptive: bool = False,
+      adam_b1: float = 0.9,
+      adam_b2: float = 0.999,
+      adam_eps_root: float = 0.0,
+      adam_weight_decay: float = 0.0,
+  ):
+  
+    opt = optax.contrib.muon(
+        learning_rate=learning_rate,
+        ns_coeffs=ns_coeffs,
+        ns_steps=ns_steps,
+        beta=beta,
+        eps=eps,
+        mu_dtype=mu_dtype,
+        nesterov=nesterov,
+        adaptive=adaptive,
+        adam_b1=adam_b1,
+        adam_b2=adam_b2,
+        adam_eps_root=adam_eps_root,
+        adam_weight_decay=adam_weight_decay,
+        )
+    super().__init__(opt)
 
 @gin.configurable
 class Lars(OptaxOptimizer):
