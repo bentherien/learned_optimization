@@ -63,8 +63,8 @@ def get_batches(task_family: tasks_base.TaskFamily,
   """Get batches of data with the `batch_shape` leading dimension."""
   
   temp = next(task_family.datasets.split(split))
-  # print(jax.tree_map(lambda x: x.shape,temp))
-  # print(jax.tree_map(lambda x: x.device_buffers,temp))
+  # print(jax.tree_util.tree_map(lambda x: x.shape,temp))
+  # print(jax.tree_util.tree_map(lambda x: x.device_buffers,temp))
   return temp
 
 def vec_get_batch(task_family, n_tasks, split, numpy=False):

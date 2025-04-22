@@ -81,7 +81,7 @@ def compute_pes_grad_pmap(
     Perform an all-gather operation on all leaf tensors in the pytree.
     The tensors are stacked along dimension 0.
     """
-    return jax.tree_map(lambda x: jax.lax.all_gather(x, 'devices', axis=axis), pytree)
+    return jax.tree_util.tree_map(lambda x: jax.lax.all_gather(x, 'devices', axis=axis), pytree)
 
   def reshape_first_three_dims(x):
     # Get shape and reshape to combine first two dims
@@ -113,21 +113,21 @@ def compute_pes_grad_pmap(
     p_yses = jax.pmap(functools.partial(allgather_pytree, axis=1), axis_name='devices')(p_yses)
     n_yses = jax.pmap(functools.partial(allgather_pytree, axis=1), axis_name='devices')(n_yses)
 
-    p_yses = jax.tree_map(reshape_last_two_dims, p_yses)
-    n_yses = jax.tree_map(reshape_last_two_dims, n_yses)
+    p_yses = jax.tree_util.tree_map(reshape_last_two_dims, p_yses)
+    n_yses = jax.tree_util.tree_map(reshape_last_two_dims, n_yses)
 
     # if jax.process_index() == 0:
     #   print("p_yses shapes:", jax.tree_util.tree_map(lambda x: x.shape, p_yses))
     #   print("n_yses shapes:", jax.tree_util.tree_map(lambda x: x.shape, n_yses))
 
-    accumulator = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0), accumulator)
-    vec_pos = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0), vec_pos)
+    accumulator = jax.tree_util.tree_map(lambda x: jnp.expand_dims(x, axis=0), accumulator)
+    vec_pos = jax.tree_util.tree_map(lambda x: jnp.expand_dims(x, axis=0), vec_pos)
 
     accumulator = jax.pmap(functools.partial(allgather_pytree, axis=0), axis_name='devices')(accumulator)
     vec_pos = jax.pmap(functools.partial(allgather_pytree, axis=0), axis_name='devices')(vec_pos)
 
-    accumulator = jax.tree_map(reshape_first_three_dims, accumulator)
-    vec_pos = jax.tree_map(reshape_first_three_dims, vec_pos)
+    accumulator = jax.tree_util.tree_map(reshape_first_three_dims, accumulator)
+    vec_pos = jax.tree_util.tree_map(reshape_first_three_dims, vec_pos)
 
   # # Only print on rank 0
   # if jax.process_index() == 0:
@@ -202,9 +202,9 @@ def compute_pes_grad_pmap(
   #   print("="*100)
   #   print("pos_loss shape:", pos_loss.shape)
   #   print("neg_loss shape:", neg_loss.shape)
-  #   print("es_grad shape:", jax.tree_map(lambda x: x.shape, es_grad))
-  #   print("new_accumulator shape:", jax.tree_map(lambda x: x.shape, new_accumulator))
-  #   print("p_ys shape:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else None, p_ys))
+  #   print("es_grad shape:", jax.tree_util.tree_map(lambda x: x.shape, es_grad))
+  #   print("new_accumulator shape:", jax.tree_util.tree_map(lambda x: x.shape, new_accumulator))
+  #   print("p_ys shape:", jax.tree_util.tree_map(lambda x: x.shape if hasattr(x, 'shape') else None, p_ys))
   #   print("delta_losses shape:", delta_losses.shape)
 
 
@@ -236,16 +236,16 @@ def compute_pes_grad_pmap(
     return x
 
   # Slice pytree outputs
-  new_accumulator = jax.tree_map(slice_first_dim, new_accumulator)
-  p_ys = jax.tree_map(lambda x: x[:, start_idx:end_idx] if hasattr(x, 'shape') else x, p_ys)
+  new_accumulator = jax.tree_util.tree_map(slice_first_dim, new_accumulator)
+  p_ys = jax.tree_util.tree_map(lambda x: x[:, start_idx:end_idx] if hasattr(x, 'shape') else x, p_ys)
   delta_losses = delta_losses[:, start_idx:end_idx]
 
 
   # print("pos_loss shape:", pos_loss.shape)
   # print("neg_loss shape:", neg_loss.shape)
-  # print("es_grad shape:", jax.tree_map(lambda x: x.shape, es_grad))
-  # print("new_accumulator shape:", jax.tree_map(lambda x: x.shape, new_accumulator))
-  # print("p_ys shape:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else None, p_ys))
+  # print("es_grad shape:", jax.tree_util.tree_map(lambda x: x.shape, es_grad))
+  # print("new_accumulator shape:", jax.tree_util.tree_map(lambda x: x.shape, new_accumulator))
+  # print("p_ys shape:", jax.tree_util.tree_map(lambda x: x.shape if hasattr(x, 'shape') else None, p_ys))
   # print("delta_losses shape:", delta_losses.shape)
   # exit(0)
   # if jax.process_index() == 0:
@@ -255,9 +255,9 @@ def compute_pes_grad_pmap(
   #   print("start_idx, end_idx:", start_idx, end_idx, "samples_per_device:", samples_per_device, "device_idx:", device_idx)
   #   print("pos_loss shape:", pos_loss.shape)
   #   print("neg_loss shape:", neg_loss.shape)
-  #   print("es_grad shape:", jax.tree_map(lambda x: x.shape, es_grad))
-  #   print("new_accumulator shape:", jax.tree_map(lambda x: x.shape, new_accumulator))
-  #   print("p_ys shape:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else None, p_ys))
+  #   print("es_grad shape:", jax.tree_util.tree_map(lambda x: x.shape, es_grad))
+  #   print("new_accumulator shape:", jax.tree_util.tree_map(lambda x: x.shape, new_accumulator))
+  #   print("p_ys shape:", jax.tree_util.tree_map(lambda x: x.shape if hasattr(x, 'shape') else None, p_ys))
   #   print("delta_losses shape:", delta_losses.shape)
 
 
@@ -524,14 +524,14 @@ class TruncatedPES(gradient_learner.GradientEstimator):
           lambda *xs: jnp.stack(xs),
           *(p_bc_grads_list + n_bc_grads_list)
       )
-      # print(jax.tree_map(lambda x: x.shape, stacked_bc_grads))
+      # print(jax.tree_util.tree_map(lambda x: x.shape, stacked_bc_grads))
       
       # Take the mean along the first two dimensions
       mean_bc_grads = jax.tree_util.tree_map(
           lambda x: jnp.mean(x, axis=(0, 1, 2)),
           stacked_bc_grads
       )
-      # print(jax.tree_map(lambda x: x.shape, mean_bc_grads))
+      # print(jax.tree_util.tree_map(lambda x: x.shape, mean_bc_grads))
       # exit(0)
     else:
       mean_bc_grads = None
