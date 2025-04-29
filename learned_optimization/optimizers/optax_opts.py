@@ -41,6 +41,8 @@ class OptaxState:
   state: chex.ArrayTree
   optax_opt_state: chex.ArrayTree
   iteration: jnp.ndarray
+  beta_delta: chex.ArrayTree
+  mom_delta: chex.ArrayTree
 
 
 class OptaxOptimizer(base.Optimizer):
@@ -54,12 +56,18 @@ class OptaxOptimizer(base.Optimizer):
            params: Params,
            model_state: Optional[ModelState] = None,
            num_steps: Optional[int] = None,
-           key: Optional[chex.PRNGKey] = None):
-    return OptaxState(  # pytype: disable=wrong-arg-types  # jax-ndarray
+           key: Optional[chex.PRNGKey] = None,
+           beta_delta: Optional[float] = 0.9,
+           ):
+    mom_delta = jax.tree_util.tree_map(jnp.zeros_like, params)
+    beta_delta = jax.tree_util.tree_map(lambda x: jnp.ones_like(x) * beta_delta, params)
+    return OptaxState(
         params=params,
         optax_opt_state=self.opt.init(params),
         state=model_state,
         iteration=0,
+        beta_delta=beta_delta,
+        mom_delta=mom_delta
     )
   
   @functools.partial(jax.jit, static_argnums=(0,))
@@ -68,12 +76,38 @@ class OptaxOptimizer(base.Optimizer):
           params: Params,
           model_state: Optional[ModelState] = None,
           key: Optional[chex.PRNGKey] = None):
-    return OptaxState(  # pytype: disable=wrong-arg-types  # jax-ndarray
+    return OptaxState(
         state=model_state,
         params=params,
         optax_opt_state=opt_state.optax_opt_state,
         iteration=opt_state.iteration,
+        beta_delta=opt_state.beta_delta,
+        mom_delta=opt_state.mom_delta
     )
+  
+  @functools.partial(jax.jit, static_argnums=(0,))
+  def update_mom_delta(self, opt_state, delta):
+        new_mom_delta = jax.tree_util.tree_map(lambda x, y, beta: beta * x + y,  opt_state.mom_delta, delta, opt_state.beta_delta)
+        return OptaxState(
+            state=opt_state.state,
+            params=opt_state.params,
+            optax_opt_state=opt_state.optax_opt_state,
+            iteration=opt_state.iteration,
+            beta_delta=opt_state.beta_delta,
+            mom_delta=new_mom_delta
+        )
+  
+  @functools.partial(jax.jit, static_argnums=(0,))
+  def correct_mom_delta(self, opt_state, compressed_delta):
+      corrected_mom_delta = jax.tree_util.tree_map(lambda x, y: x - y,  opt_state.mom_delta, compressed_delta)
+      return OptaxState(
+          state=opt_state.state,
+          params=opt_state.params,
+          optax_opt_state=opt_state.optax_opt_state,
+          iteration=opt_state.iteration,
+          beta_delta=opt_state.beta_delta,
+          mom_delta=corrected_mom_delta
+      )
 
   @functools.partial(jax.jit, static_argnums=(0,))
   def update(self,
@@ -91,6 +125,8 @@ class OptaxOptimizer(base.Optimizer):
         params=optax.apply_updates(opt_state.params, update),
         optax_opt_state=new_opt_state,
         iteration=opt_state.iteration + 1,
+        beta_delta=opt_state.beta_delta,
+        mom_delta=opt_state.mom_delta,
     )
 
 
