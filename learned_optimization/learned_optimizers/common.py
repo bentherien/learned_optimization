@@ -62,15 +62,15 @@ def rolling_rms(decay: float) -> _InitUpdate:
 
 
 def _vmap_accumulator(accumulator: Callable[[float], _InitUpdate],
-                      decays: jnp.ndarray) -> _InitUpdate:
+                      decays: jnp.ndarray, **kwargs) -> _InitUpdate:
   """Helper function that vmaps an accumulator fn to run on multiple decays."""
 
   def init_fn(p):
     return jax.vmap(lambda d: accumulator(d).init(p), out_axes=-1)(decays)  # pytype: disable=wrong-arg-types  # jax-ndarray
 
-  def update(state, grads):
+  def update(state, grads, **kwargs):
     return jax.vmap(
-        lambda s, d: accumulator(d).update(s, grads),  # pytype: disable=wrong-arg-types  # jax-ndarray
+        lambda s, d: accumulator(d).update(s, grads, **kwargs),  # pytype: disable=wrong-arg-types  # jax-ndarray
         in_axes=-1,
         out_axes=-1,
     )(state, decays)
@@ -88,8 +88,8 @@ def vec_rolling_rms(decays: jnp.ndarray) -> _InitUpdate:
   return _vmap_accumulator(rolling_rms, decays)
 
 
-def safe_rsqrt(x: jnp.ndarray) -> jnp.ndarray:
-  return jax.lax.rsqrt(jnp.maximum(x, 1e-9))
+def safe_rsqrt(x: jnp.ndarray, epsilon: float = 1e-9) -> jnp.ndarray:
+  return jax.lax.rsqrt(jnp.maximum(x, epsilon))
 
 
 @flax.struct.dataclass
@@ -156,7 +156,7 @@ def factored_rolling(decay_rate: float, epsilon: float = 1e-30) -> _InitUpdate:
         v_col=jax.tree_util.tree_unflatten(tree, v_cols),
         v_diag=jax.tree_util.tree_unflatten(tree, v_fulls))
 
-  def update_fn(state: FactoredAccum, grad: Any) -> Tuple[FactoredAccum, Any]:
+  def update_fn(state: FactoredAccum, grad: Any, local_epsilon: float = 1e-9) -> Tuple[FactoredAccum, Any]:
 
     def update_one(v_col: Any, v_row: Any, v_full: Any,
                    g: Any) -> Tuple[Any, Any, Any, Any]:
@@ -177,8 +177,8 @@ def factored_rolling(decay_rate: float, epsilon: float = 1e-30) -> _InitUpdate:
         reduced_d1 = d1 - 1 if d1 > d0 else d1
         row_col_mean = jnp.mean(new_v_row, axis=reduced_d1, keepdims=True)
 
-        row_factor = safe_rsqrt(new_v_row / (row_col_mean + 1e-9))
-        col_factor = safe_rsqrt(new_v_col)
+        row_factor = safe_rsqrt(new_v_row / (row_col_mean + local_epsilon), epsilon=local_epsilon)
+        col_factor = safe_rsqrt(new_v_col, epsilon=local_epsilon)
         y = (
             g * jnp.expand_dims(row_factor, axis=d0) *
             jnp.expand_dims(col_factor, axis=d1))
@@ -187,7 +187,7 @@ def factored_rolling(decay_rate: float, epsilon: float = 1e-30) -> _InitUpdate:
       else:
         # otherwise precondition with diagonal style preconditioner
         new_v = clip_decay_rate * v_full + mixing_rate * grad_sqr
-        y = g * safe_rsqrt(new_v + 1e-9)
+        y = g * safe_rsqrt(new_v + local_epsilon, epsilon=local_epsilon)
         return jnp.asarray([], jnp.float32), jnp.asarray([],
                                                          jnp.float32), new_v, y
 
@@ -211,6 +211,6 @@ def factored_rolling(decay_rate: float, epsilon: float = 1e-30) -> _InitUpdate:
   return _InitUpdate(init_fn, update_fn)
 
 
-def vec_factored_rolling(decays: jnp.ndarray) -> _InitUpdate:
+def vec_factored_rolling(decays: jnp.ndarray, local_epsilon: float = 1e-9) -> _InitUpdate:
   """Vectorized accumulator to keep track of factored accumulators."""
-  return _vmap_accumulator(factored_rolling, decays)
+  return _vmap_accumulator(factored_rolling, decays, local_epsilon=local_epsilon)
