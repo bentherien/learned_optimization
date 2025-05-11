@@ -578,7 +578,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
       # metrics["sample||delta_loss_sample"] = summary.sample_value(
       #     key, jnp.abs(delta_loss))
       # metrics["mean||delta_loss_mean"] = jnp.abs(delta_loss)
-      metrics["sample||baseline_loss"] = b_loss
+      # metrics["sample||baseline_loss"] = b_loss
       if hasattr(p_state, "inner_step"):
         metrics["sample||inner_step"] = p_state.inner_step[0]
         metrics["sample||end_inner_step"] = p_state.inner_step[0]
