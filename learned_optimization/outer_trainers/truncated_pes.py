@@ -56,6 +56,7 @@ def compute_pes_grad_pmap(
     sign_delta_loss_scalar: Optional[float] = None,
     samples_per_device: int = 1,
     device_idx: int = 0,
+    baseline_losses: Optional[list[float]] = None,
 ) -> Tuple[float, MetaParams, MetaParams, truncated_step_mod.TruncatedUnrollOut,
            float]:
   """Compute the PES gradient estimate from the outputs of many unrolls.
@@ -252,7 +253,7 @@ def compute_pes_grad_pmap(
 
 
 
-# @functools.partial(jax.jit, static_argnames=("std", "timer_obj", "sign_delta_loss_scalar", "samples_per_device", "device_idx"))
+@functools.partial(jax.jit, static_argnames=("std", "timer_obj", "sign_delta_loss_scalar", "samples_per_device", "device_idx"))
 def compute_pes_grad(
     p_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
     n_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
