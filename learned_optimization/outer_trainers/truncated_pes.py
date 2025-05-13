@@ -419,7 +419,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
 
     
     self.baseline_losses = baseline_losses
-    if self.use_baseline_losses is not None:
+    if self.use_baseline_losses is not None and self.baseline_losses is not None:
       self.baseline_losses = jnp.array(self.baseline_losses, device=jax.devices()[jax.process_index()])
 
     assert self.timer_obj is not None, "timer_obj must be provided"
