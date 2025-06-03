@@ -477,6 +477,7 @@ class VectorizedLOptTruncatedStep(truncated_step.VectorizedTruncatedStep,
       meta_loss_with_aux_key: Optional[str] = None,
       task_name: Optional[str] = None,
       use_bc_grads: bool = False,
+      random_initial_iteration_offset_linspace: bool = False,
   ):
     """Initializer.
 
@@ -507,6 +508,7 @@ class VectorizedLOptTruncatedStep(truncated_step.VectorizedTruncatedStep,
     self.num_tasks = num_tasks
     self.meta_loss_split = meta_loss_split
     self.random_initial_iteration_offset = random_initial_iteration_offset
+    self.random_initial_iteration_offset_linspace = random_initial_iteration_offset_linspace
     self.outer_data_split = outer_data_split
     self.meta_loss_with_aux_key = meta_loss_with_aux_key
     self._task_name = task_name
@@ -551,12 +553,23 @@ class VectorizedLOptTruncatedStep(truncated_step.VectorizedTruncatedStep,
     # When initializing, we want to keep the trajectories not all in sync.
     # To do this, we can initialize with a random offset on the inner-step.
     if self.random_initial_iteration_offset:
-      inner_step = jax.random.randint(
-          key2,
-          unroll_state.inner_step.shape,
-          0,
-          self.random_initial_iteration_offset,
-          dtype=unroll_state.inner_step.dtype)
+      if self.random_initial_iteration_offset_linspace:
+        # Create evenly spaced offsets from 0 to random_initial_iteration_offset
+        offsets = jnp.linspace(0, 
+                              self.random_initial_iteration_offset-1,
+                              num=unroll_state.inner_step.shape[0], 
+                              dtype=unroll_state.inner_step.dtype)
+        inner_step = jnp.asarray(offsets, dtype=unroll_state.inner_step.dtype)
+      else:
+        inner_step = jax.random.randint(
+            key2,
+            unroll_state.inner_step.shape,
+            0,
+            self.random_initial_iteration_offset,
+            dtype=unroll_state.inner_step.dtype)
+
+
+
       unroll_state = unroll_state.replace(inner_step=inner_step)
 
     return unroll_state
