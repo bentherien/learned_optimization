@@ -478,6 +478,7 @@ class VectorizedLOptTruncatedStep(truncated_step.VectorizedTruncatedStep,
       task_name: Optional[str] = None,
       use_bc_grads: bool = False,
       random_initial_iteration_offset_linspace: bool = False,
+      global_num_particles: int = 1,
   ):
     """Initializer.
 
@@ -514,6 +515,9 @@ class VectorizedLOptTruncatedStep(truncated_step.VectorizedTruncatedStep,
     self._task_name = task_name
     self.timings = []
     self.use_bc_grads = use_bc_grads
+    self.global_num_particles = global_num_particles
+
+
 
     self.data_shape = jax.tree_util.tree_map(
         lambda x: core.ShapedArray(shape=x.shape, dtype=x.dtype),
@@ -521,6 +525,7 @@ class VectorizedLOptTruncatedStep(truncated_step.VectorizedTruncatedStep,
             task_family, num_tasks, split="train", numpy=True
         ),
     )
+
 
   def outer_init(self, key):
     return self.learned_opt.init(key)
@@ -555,11 +560,28 @@ class VectorizedLOptTruncatedStep(truncated_step.VectorizedTruncatedStep,
     if self.random_initial_iteration_offset:
       if self.random_initial_iteration_offset_linspace:
         # Create evenly spaced offsets from 0 to random_initial_iteration_offset
-        offsets = jnp.linspace(0, 
-                              self.random_initial_iteration_offset-1,
-                              num=unroll_state.inner_step.shape[0], 
-                              dtype=unroll_state.inner_step.dtype)
-        inner_step = jnp.asarray(offsets, dtype=unroll_state.inner_step.dtype)
+        curr_num_particles = unroll_state.inner_step.shape[0]
+
+        if self.global_num_particles > curr_num_particles:
+          # First get offsets for all particles across devices
+          all_offsets = jnp.linspace(0,
+                                    self.random_initial_iteration_offset-1, 
+                                    num=self.global_num_particles,
+                                    dtype=unroll_state.inner_step.dtype)
+          
+          # Get slice for current device
+          idx = jax.process_index()
+          start_idx = idx * curr_num_particles
+          end_idx = (idx + 1) * curr_num_particles
+          offsets = all_offsets[start_idx:end_idx]
+          inner_step = jnp.asarray(offsets, dtype=unroll_state.inner_step.dtype)
+
+        else:
+          offsets = jnp.linspace(0, 
+                                self.random_initial_iteration_offset-1,
+                                num=unroll_state.inner_step.shape[0], 
+                                dtype=unroll_state.inner_step.dtype)
+          inner_step = jnp.asarray(offsets, dtype=unroll_state.inner_step.dtype)
       else:
         inner_step = jax.random.randint(
             key2,
