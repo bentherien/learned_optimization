@@ -24,7 +24,9 @@ import gin
 import haiku as hk
 import jax
 from jax import lax
+from jax.experimental import mesh_utils
 import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from learned_optimization import jax_utils
 from learned_optimization import profile
 from learned_optimization import summary
@@ -45,6 +47,10 @@ class PESWorkerState(gradient_learner.GradientEstimatorState):
   accumulator: MetaParams
 
 
+# DEPRECATED: Use compute_pes_grad_sharded instead. This function uses jax.pmap
+# + jax.lax.all_gather which breaks with modern JAX's jax.distributed.initialize()
+# because pmap sees all global devices but each process only has local data.
+# Kept for reference.
 # @functools.partial(jax.jit, static_argnames=("std", "sign_delta_loss_scalar"))
 def compute_pes_grad_pmap(
     p_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
@@ -253,6 +259,217 @@ def compute_pes_grad_pmap(
 
 
 
+@functools.partial(jax.jit, static_argnames=("std", "sign_delta_loss_scalar", "replicated"))
+def _pes_grad_sharded_inner(p_ys, n_ys, accumulator, vec_pos, std,
+                            sign_delta_loss_scalar, baseline_losses,
+                            replicated):
+  """JIT-compiled inner function: all-gather via sharding constraint, then PES gradient."""
+  # All-gather: replicate all sharded arrays across devices
+  p_ys = jax.tree_util.tree_map(
+      lambda x: lax.with_sharding_constraint(x, replicated), p_ys)
+  n_ys = jax.tree_util.tree_map(
+      lambda x: lax.with_sharding_constraint(x, replicated), n_ys)
+  accumulator = jax.tree_util.tree_map(
+      lambda x: lax.with_sharding_constraint(x, replicated), accumulator)
+  vec_pos = jax.tree_util.tree_map(
+      lambda x: lax.with_sharding_constraint(x, replicated), vec_pos)
+
+  # PES gradient computation (identical to compute_pes_grad)
+  if baseline_losses is not None:
+    b = jnp.take(baseline_losses, p_ys.iteration, axis=0)
+    delta_losses = (p_ys.loss - b) - (n_ys.loss - b)
+    pos_loss_b = jnp.sum((p_ys.loss - b) * p_ys.mask, axis=0) / jnp.sum(
+        p_ys.mask, axis=0)
+    neg_loss_b = jnp.sum((n_ys.loss - b) * n_ys.mask, axis=0) / jnp.sum(
+        n_ys.mask, axis=0)
+    b_loss = jnp.mean((pos_loss_b + neg_loss_b) / 2.0)
+  else:
+    b_loss = 0.0
+    delta_losses = p_ys.loss - n_ys.loss
+
+  if sign_delta_loss_scalar:
+    sign_per_task = jnp.sign(jnp.mean(delta_losses * p_ys.mask, axis=0))
+    delta_losses = jnp.ones_like(
+        delta_losses) * sign_per_task * sign_delta_loss_scalar
+
+  has_finished = lax.cumsum(jnp.asarray(p_ys.is_done, dtype=jnp.int32)) > 0
+
+  denom = jnp.sum(p_ys.mask, axis=0)
+
+  last_unroll_loss = jnp.sum(
+      delta_losses * (1.0 - has_finished) * p_ys.mask, axis=0) / denom
+
+  new_unroll_loss = jnp.sum(
+      delta_losses * has_finished * p_ys.mask, axis=0) / denom
+
+  factor = 1.0 / (2 * std**2)
+
+  accumulator = tree_utils.tree_add(vec_pos, accumulator)
+
+  num_tasks = last_unroll_loss.shape[0]
+
+  def reshape_to(loss, p):
+    return loss.reshape((num_tasks,) + (1,) * (len(p.shape) - 1)) * factor * p
+
+  es_grad_from_accum = jax.tree_util.tree_map(
+      functools.partial(reshape_to, last_unroll_loss), accumulator)
+
+  es_grad_from_new_perturb = jax.tree_util.tree_map(
+      functools.partial(reshape_to, new_unroll_loss), vec_pos)
+
+  vec_es_grad = jax.tree_util.tree_map(lambda a, b: a + b, es_grad_from_accum,
+                                       es_grad_from_new_perturb)
+
+  es_grad = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), vec_es_grad)
+
+  def _switch_one_accum(a, b):
+    shape = [num_tasks] + [1] * (len(a.shape) - 1)
+    return jnp.where(jnp.reshape(has_finished[-1], shape), a, b)
+
+  new_accumulator = jax.tree_util.tree_map(_switch_one_accum, vec_pos,
+                                           accumulator)
+
+  pos_loss = jnp.sum(p_ys.loss * p_ys.mask, axis=0) / jnp.sum(
+      p_ys.mask, axis=0)
+  neg_loss = jnp.sum(n_ys.loss * n_ys.mask, axis=0) / jnp.sum(
+      n_ys.mask, axis=0)
+
+  return (
+      jnp.mean((pos_loss + neg_loss) / 2.0),
+      b_loss,
+      es_grad,
+      new_accumulator,
+      p_ys,
+      delta_losses,
+  )
+
+
+def compute_pes_grad_sharded(
+    p_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
+    n_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
+    accumulator: MetaParams,
+    vec_pos: MetaParams,
+    std: float,
+    timer_obj: Any,
+    sign_delta_loss_scalar: Optional[float] = None,
+    samples_per_device: int = 1,
+    device_idx: int = 0,
+    baseline_losses: Optional[jnp.ndarray] = None,
+    mesh: Optional[Mesh] = None,
+) -> Tuple[float, float, MetaParams, MetaParams,
+           truncated_step_mod.TruncatedUnrollOut, jnp.ndarray]:
+  """Compute PES gradient using JAX mesh-based sharding for multi-GPU all-gather.
+
+  Replaces compute_pes_grad_pmap. Each process holds local particles; this
+  function creates globally-sharded arrays, uses jax.jit with
+  with_sharding_constraint to trigger all-gather, then slices results per-device.
+
+  Args:
+    p_yses: Sequence of PES outputs from the positive perturbation (local).
+    n_yses: Sequence of PES outputs from the negative perturbation (local).
+    accumulator: Current PES accumulator (local, shape [local_tasks, ...]).
+    vec_pos: Positive perturbations (local, shape [local_tasks, ...]).
+    std: Standard deviation of perturbations.
+    timer_obj: Timer context manager for profiling.
+    sign_delta_loss_scalar: Optional sign-based delta loss scaling.
+    samples_per_device: Number of tasks per device.
+    device_idx: Index of the current device/process.
+    baseline_losses: Optional baseline losses for variance reduction.
+    mesh: JAX Mesh for sharding (created in TruncatedPES.__init__).
+
+  Returns:
+    Tuple of (loss, b_loss, es_grad, new_accumulator, p_ys, delta_losses).
+  """
+  def flat_first(x):
+    return x.reshape([x.shape[0] * x.shape[1]] + list(x.shape[2:]))
+
+  # Stack and flatten locally
+  p_ys = jax.tree_util.tree_map(flat_first, tree_utils.tree_zip_jnp(p_yses))
+  n_ys = jax.tree_util.tree_map(flat_first, tree_utils.tree_zip_jnp(n_yses))
+
+  # Set up shardings
+  replicated = NamedSharding(mesh, P())
+  sharding_axis1 = NamedSharding(mesh, P(None, 'devices'))
+  sharding_axis0 = NamedSharding(mesh, P('devices'))
+
+  num_devices = jax.device_count()
+  local_device = jax.local_devices()[0]
+
+  def _to_single_device(arr):
+    """Ensure arr is a single-device array on the local device.
+
+    Arrays from previous iterations may be multi-device (e.g. replicated JIT
+    outputs after slicing). jax.device_put requires fully-addressable arrays,
+    so we use addressable_data(0) to extract the local shard instead.
+    """
+    if isinstance(arr, jax.Array) and not arr.is_fully_addressable:
+      return arr.addressable_data(0)
+    return jax.device_put(arr, local_device)
+
+  def make_global_axis1(local_arr):
+    """[steps, local_tasks] -> global [steps, total_tasks] sharded on axis 1."""
+    global_shape = list(local_arr.shape)
+    global_shape[1] = global_shape[1] * num_devices
+    local_arr = _to_single_device(local_arr)
+    return jax.make_array_from_single_device_arrays(
+        tuple(global_shape), sharding_axis1, [local_arr])
+
+  def make_global_axis0(local_arr):
+    """[local_tasks, ...] -> global [total_tasks, ...] sharded on axis 0."""
+    global_shape = list(local_arr.shape)
+    global_shape[0] = global_shape[0] * num_devices
+    local_arr = _to_single_device(local_arr)
+    return jax.make_array_from_single_device_arrays(
+        tuple(global_shape), sharding_axis0, [local_arr])
+
+  # Create globally-sharded arrays from local per-process data
+  with timer_obj("PES Gather", []):
+    p_ys = jax.tree_util.tree_map(make_global_axis1, p_ys)
+    n_ys = jax.tree_util.tree_map(make_global_axis1, n_ys)
+    accumulator = jax.tree_util.tree_map(make_global_axis0, accumulator)
+    vec_pos = jax.tree_util.tree_map(make_global_axis0, vec_pos)
+
+  # Make baseline_losses a replicated global array if present
+  if baseline_losses is not None:
+    baseline_losses = jax.make_array_from_single_device_arrays(
+        baseline_losses.shape, replicated,
+        [_to_single_device(baseline_losses)])
+
+  # JIT-compiled all-gather + PES gradient computation
+  loss, b_loss, es_grad, new_accumulator, p_ys_out, delta_losses = (
+      _pes_grad_sharded_inner(
+          p_ys, n_ys, accumulator, vec_pos,
+          std=std,
+          sign_delta_loss_scalar=sign_delta_loss_scalar,
+          baseline_losses=baseline_losses,
+          replicated=replicated,
+      ))
+
+  # Per-device slicing: extract this process's portion of per-task outputs
+  start_idx = device_idx * samples_per_device
+  end_idx = start_idx + samples_per_device
+
+  def slice_first_dim(x):
+    if hasattr(x, 'shape'):
+      return x[start_idx:end_idx]
+    return x
+
+  new_accumulator = jax.tree_util.tree_map(slice_first_dim, new_accumulator)
+  p_ys_out = jax.tree_util.tree_map(
+      lambda x: x[:, start_idx:end_idx] if hasattr(x, 'shape') else x,
+      p_ys_out)
+  delta_losses = delta_losses[:, start_idx:end_idx]
+
+  return (
+      loss,
+      b_loss,
+      es_grad,
+      new_accumulator,
+      p_ys_out,
+      delta_losses,
+  )
+
+
 @functools.partial(jax.jit, static_argnames=("std", "timer_obj", "sign_delta_loss_scalar", "samples_per_device", "device_idx"))
 def compute_pes_grad(
     p_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
@@ -412,7 +629,13 @@ class TruncatedPES(gradient_learner.GradientEstimator):
     self.trunc_schedule = trunc_schedule
     self.update_truncation_length(0)
     self.samples_per_device = self.truncated_step.num_tasks
-    self.grad_fn = compute_pes_grad_pmap if pmap_across_devices else compute_pes_grad
+    if pmap_across_devices:
+      devices = mesh_utils.create_device_mesh((jax.device_count(),))
+      self.mesh = Mesh(devices, axis_names=('devices',))
+      self.grad_fn = functools.partial(compute_pes_grad_sharded, mesh=self.mesh)
+    else:
+      self.mesh = None
+      self.grad_fn = compute_pes_grad
     self.timer_obj = timer_obj
     self.use_bc_grads = use_bc_grads
     self.use_baseline_losses = use_baseline_losses
