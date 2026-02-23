@@ -175,6 +175,7 @@ learned_optimization/optimizers/__pycache__/optimizer_wrappers.cpython-39.pyc
 learned_optimization/optimizers/data/opt_list.json
 learned_optimization/outer_trainers/__init__.py
 learned_optimization/outer_trainers/common.py
+learned_optimization/outer_trainers/es_single.py
 learned_optimization/outer_trainers/full_es.py
 learned_optimization/outer_trainers/full_es_test.py
 learned_optimization/outer_trainers/full_grad.py
