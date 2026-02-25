@@ -13,20 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ES-Single: a truncated, accumulator-free Evolution Strategies gradient estimator.
+"""ES-Single: accumulator-free, unbiased Evolution Strategies gradient estimator.
+
+Implements the algorithm from:
+  "Low-Variance Gradient Estimation in Unrolled Computation Graphs with
+   ES-Single" (arXiv:2304.11153).
 
 Unlike TruncatedPES, ES-Single does NOT maintain a persistent accumulator of
-past perturbations across truncation windows. Each window is treated
-independently:
+past gradient contributions. Instead, it fixes a single perturbation vec_pos
+at the beginning of each inner problem and reuses it across ALL truncation
+windows of that problem:
 
     grad = mean_over_tasks( vec_pos * delta_loss / (2 * std^2) )
 
 where delta_loss = pos_loss - neg_loss averaged over the current window.
 
-This makes the estimator simpler (no accumulator state), lower-variance, but
-higher-bias compared to PES. It is faithful to the scalar reference
-implementation in snippets/es-single.py, adapted to the VectorizedTruncatedStep
-framework used by the rest of this codebase.
+The key invariant (from the reference in snippets/es-single.py): the
+perturbation is only resampled when the inner problem resets (is_done). Using
+the same noise throughout one inner problem makes the estimator unbiased
+(unlike vanilla truncated ES which re-samples each window). No accumulator
+state is needed because the perturbation is stored directly in the worker state.
 """
 
 import functools
@@ -55,9 +61,15 @@ TruncatedUnrollState = Any
 
 @flax.struct.dataclass
 class ESSingleWorkerState(gradient_learner.GradientEstimatorState):
-  """State for ESSingle. Only pos/neg inner states; no accumulator."""
+  """State for ESSingle.
+
+  Stores pos/neg inner states and the persistent perturbation vec_pos.
+  vec_pos is fixed for the entire inner problem and only resampled on reset,
+  matching the reference algorithm in snippets/es-single.py.
+  """
   pos_state: TruncatedUnrollState
   neg_state: TruncatedUnrollState
+  vec_pos: MetaParams  # Persistent perturbation — fixed per inner problem.
 
 
 # ---------------------------------------------------------------------------
@@ -292,11 +304,12 @@ class ESSingle(gradient_learner.GradientEstimator):
   window steps.
 
   Compared to TruncatedPES:
-  - **No accumulator** — state is just (pos_state, neg_state), not
+  - **No accumulator** — state is (pos_state, neg_state, vec_pos), not
     (pos_state, neg_state, accumulator).
-  - **Higher bias** — history before the current window is ignored.
+  - **Unbiased** — the perturbation is fixed per inner problem, so truncation
+    bias is eliminated (see arXiv:2304.11153).
   - **Lower variance** — no amplification from accumulated perturbations.
-  - **Simpler** — straightforward to reason about and debug.
+  - **Simpler** — no accumulator to track; vec_pos is reset only on is_done.
 
   Constructor arguments intentionally mirror TruncatedPES so the two
   estimators are drop-in replaceable in meta_trainers.py.
@@ -349,14 +362,18 @@ class ESSingle(gradient_learner.GradientEstimator):
   @profile.wrap()
   def init_worker_state(self, worker_weights: gradient_learner.WorkerWeights,
                         key: PRNGKey) -> ESSingleWorkerState:
-    """Initialise inner-problem states. No accumulator needed."""
+    """Initialise inner-problem states and sample the initial perturbation."""
     theta = worker_weights.theta
+    rng = hk.PRNGSequence(key)
     pos_unroll_state = self.truncated_step.init_step_state(
-        theta, worker_weights.outer_state, key, theta_is_vector=False)
+        theta, worker_weights.outer_state, next(rng), theta_is_vector=False)
     neg_unroll_state = pos_unroll_state
+    vec_pos, _, _ = common.vector_sample_perturbations(
+        theta, next(rng), self.std, self.truncated_step.num_tasks)
     return ESSingleWorkerState(
         pos_state=pos_unroll_state,
-        neg_state=neg_unroll_state)
+        neg_state=neg_unroll_state,
+        vec_pos=vec_pos)
 
   def update_truncation_length(self, iteration):
     """Update trunc_length from the optional schedule."""
@@ -385,9 +402,11 @@ class ESSingle(gradient_learner.GradientEstimator):
 
     theta = worker_weights.theta
 
-    # Sample antithetic perturbations for all tasks.
-    vec_pos, vec_p_theta, vec_n_theta = common.vector_sample_perturbations(
-        theta, next(rng), self.std, self.truncated_step.num_tasks)
+    # ES-Single: reuse the perturbation fixed at the start of the inner problem.
+    # vec_pos is persistent in state and only resampled when a task resets.
+    vec_pos = state.vec_pos
+    vec_p_theta = jax.tree_util.tree_map(lambda t, p: t + p, theta, vec_pos)
+    vec_n_theta = jax.tree_util.tree_map(lambda t, p: t - p, theta, vec_pos)
 
     p_yses = []
     n_yses = []
@@ -451,6 +470,19 @@ class ESSingle(gradient_learner.GradientEstimator):
         samples_per_device=self.samples_per_device,
         device_idx=jax.process_index())
 
+    # Resample perturbations for tasks whose inner problem reset this window.
+    # Tasks where is_done fired get fresh noise; others keep the same vec_pos.
+    # This matches the reference (snippets/es-single.py): key only splits on reset.
+    did_reset = jnp.any(p_ys.is_done, axis=0)  # [num_tasks]
+    new_vec_pos, _, _ = common.vector_sample_perturbations(
+        theta, next(rng), self.std, self.truncated_step.num_tasks)
+
+    def _select(old, new):
+      mask = did_reset.reshape((did_reset.shape[0],) + (1,) * (len(old.shape) - 1))
+      return jnp.where(mask, new, old)
+
+    updated_vec_pos = jax.tree_util.tree_map(_select, vec_pos, new_vec_pos)
+
     unroll_info = gradient_learner.UnrollInfo(
         loss=p_ys.loss,
         iteration=p_ys.iteration,
@@ -461,7 +493,7 @@ class ESSingle(gradient_learner.GradientEstimator):
         mean_loss=loss,
         grad=es_grad,
         bc_grad=mean_bc_grads,
-        unroll_state=ESSingleWorkerState(p_state, n_state),
+        unroll_state=ESSingleWorkerState(p_state, n_state, updated_vec_pos),
         unroll_info=unroll_info)
 
     metrics = summary.aggregate_metric_list(
