@@ -404,7 +404,15 @@ class ESSingle(gradient_learner.GradientEstimator):
 
     # ES-Single: reuse the perturbation fixed at the start of the inner problem.
     # vec_pos is persistent in state and only resampled when a task resets.
-    vec_pos = state.vec_pos
+    #
+    # Device note: in multi-GPU sharded mode, the sharded grad path uses
+    # lax.with_sharding_constraint(..., replicated) which places p_ys on all
+    # global GPUs.  To prevent that global sharding from propagating into
+    # vec_pos (and thus into vec_p_theta on the NEXT iteration), we pin vec_pos
+    # to the local device here.  This is safe because each process owns a
+    # disjoint subset of tasks and vec_pos values are the same on all replicas.
+    _local_dev = jax.local_devices()[0]
+    vec_pos = jax.device_put(state.vec_pos, _local_dev)
     vec_p_theta = jax.tree_util.tree_map(lambda t, p: t + p, theta, vec_pos)
     vec_n_theta = jax.tree_util.tree_map(lambda t, p: t - p, theta, vec_pos)
 
@@ -473,7 +481,13 @@ class ESSingle(gradient_learner.GradientEstimator):
     # Resample perturbations for tasks whose inner problem reset this window.
     # Tasks where is_done fired get fresh noise; others keep the same vec_pos.
     # This matches the reference (snippets/es-single.py): key only splits on reset.
-    did_reset = jnp.any(p_ys.is_done, axis=0)  # [num_tasks]
+    #
+    # Device note: p_ys.is_done may be globally-sharded (all GPUs) because it
+    # went through lax.with_sharding_constraint in the sharded grad path.  Pin
+    # it to the local device before computing did_reset so that updated_vec_pos
+    # stays local and doesn't infect vec_p_theta on the next iteration.
+    is_done_local = jax.device_put(p_ys.is_done, _local_dev)
+    did_reset = jnp.any(is_done_local, axis=0)  # [num_tasks]
     new_vec_pos, _, _ = common.vector_sample_perturbations(
         theta, next(rng), self.std, self.truncated_step.num_tasks)
 
