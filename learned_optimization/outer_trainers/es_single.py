@@ -411,8 +411,17 @@ class ESSingle(gradient_learner.GradientEstimator):
     # vec_pos (and thus into vec_p_theta on the NEXT iteration), we pin vec_pos
     # to the local device here.  This is safe because each process owns a
     # disjoint subset of tasks and vec_pos values are the same on all replicas.
+    #
+    # We use addressable_data(0) for globally-sharded arrays (device_put only
+    # works on fully-addressable arrays), falling back to device_put otherwise.
     _local_dev = jax.local_devices()[0]
-    vec_pos = jax.device_put(state.vec_pos, _local_dev)
+
+    def _to_local(x):
+      if isinstance(x, jax.Array) and not x.is_fully_addressable:
+        return x.addressable_data(0)
+      return jax.device_put(x, _local_dev)
+
+    vec_pos = jax.tree_util.tree_map(_to_local, state.vec_pos)
     vec_p_theta = jax.tree_util.tree_map(lambda t, p: t + p, theta, vec_pos)
     vec_n_theta = jax.tree_util.tree_map(lambda t, p: t - p, theta, vec_pos)
 
@@ -486,7 +495,7 @@ class ESSingle(gradient_learner.GradientEstimator):
     # went through lax.with_sharding_constraint in the sharded grad path.  Pin
     # it to the local device before computing did_reset so that updated_vec_pos
     # stays local and doesn't infect vec_p_theta on the next iteration.
-    is_done_local = jax.device_put(p_ys.is_done, _local_dev)
+    is_done_local = _to_local(p_ys.is_done)
     did_reset = jnp.any(is_done_local, axis=0)  # [num_tasks]
     new_vec_pos, _, _ = common.vector_sample_perturbations(
         theta, next(rng), self.std, self.truncated_step.num_tasks)
