@@ -229,6 +229,7 @@ def progress_or_reset_inner_opt_state(
     axis_name: Optional[str] = None,
     meta_loss_with_aux_key: Optional[str] = None,
     use_bc_grads: bool = False,
+    gradient_accumulation_steps: int = 1,
 ) -> Tuple[T, G, int, jnp.ndarray]:
   """Train a single step, or reset the current inner problem."""
   # summary.summary("num_steps", num_steps, aggregation="sample")  # pytype: disable=wrong-arg-types  # jax-ndarray
@@ -279,9 +280,26 @@ def progress_or_reset_inner_opt_state(
       meta_loss = aux[meta_loss_with_aux_key]
     else:
       # Otherwise we can just use loss_with_state.
-      (l, s), g = jax.value_and_grad(
-          task.loss_with_state, has_aux=True)(p, s, key1, data)
-      meta_loss = l
+      if gradient_accumulation_steps > 1:
+        # data shape: [K, bsz, ...] — accumulate gradients over K micro-batches
+        def accum_step(carry, micro_data):
+          grad_sum, loss_sum, s_acc = carry
+          (l_i, s_i), g_i = jax.value_and_grad(
+              task.loss_with_state, has_aux=True)(p, s, key1, micro_data)
+          grad_sum = jax.tree_util.tree_map(jnp.add, grad_sum, g_i)
+          return (grad_sum, loss_sum + l_i, s_i), None
+
+        zero_grads = jax.tree_util.tree_map(jnp.zeros_like, p)
+        (grad_sum, loss_sum, s), _ = jax.lax.scan(
+            accum_step, (zero_grads, jnp.float32(0.0), s), data)
+
+        g = jax.tree_util.tree_map(lambda x: x / gradient_accumulation_steps, grad_sum)
+        l = loss_sum / gradient_accumulation_steps
+        meta_loss = l
+      else:
+        (l, s), g = jax.value_and_grad(
+            task.loss_with_state, has_aux=True)(p, s, key1, data)
+        meta_loss = l
 
     if axis_name:
       g = jax.lax.pmean(g, axis_name=axis_name)
@@ -336,6 +354,7 @@ def _truncated_unroll_one_step(
     meta_loss_with_aux_key,
     override_num_steps: Optional[int] = None,
     use_bc_grads: bool = False,
+    gradient_accumulation_steps: int = 1,
 ) -> Tuple[TruncatedUnrollState, truncated_step.TruncatedUnrollOut]:
   """Train a given inner problem state a single step or reset it when done."""
   key1, key2 = jax.random.split(key)
@@ -358,6 +377,7 @@ def _truncated_unroll_one_step(
           data=data,
           meta_loss_with_aux_key=meta_loss_with_aux_key,
           use_bc_grads=use_bc_grads,
+          gradient_accumulation_steps=gradient_accumulation_steps,
       )
   )
 
@@ -391,9 +411,10 @@ def _truncated_unroll_one_step(
 @functools.partial(
     jax.jit,
     static_argnames=("task_family", "learned_opt", "trunc_sched",
-                     "meta_loss_with_aux_key", "use_bc_grads"))
+                     "meta_loss_with_aux_key", "use_bc_grads",
+                     "gradient_accumulation_steps"))
 @functools.partial(
-    jax.vmap, in_axes=(None, None, None, None, 0, 0, 0, None, None, None, None))
+    jax.vmap, in_axes=(None, None, None, None, 0, 0, 0, None, None, None, None, None))
 def truncated_unroll_one_step(
     task_family: tasks_base.TaskFamily,
     learned_opt: lopt_base.LearnedOptimizer,
@@ -406,6 +427,7 @@ def truncated_unroll_one_step(
     meta_loss_with_aux_key: Optional[str],
     override_num_steps: Optional[int],
     use_bc_grads: bool = False,
+    gradient_accumulation_steps: int = 1,
 ) -> Tuple[TruncatedUnrollState, truncated_step.TruncatedUnrollOut]:
   """Perform one step of inner training without vectorized theta."""
   return _truncated_unroll_one_step(
@@ -419,15 +441,17 @@ def truncated_unroll_one_step(
       outer_state=outer_state,
       meta_loss_with_aux_key=meta_loss_with_aux_key,
       override_num_steps=override_num_steps,
-      use_bc_grads=use_bc_grads)
+      use_bc_grads=use_bc_grads,
+      gradient_accumulation_steps=gradient_accumulation_steps)
 
 
 @functools.partial(
     jax.jit,
     static_argnames=("task_family", "learned_opt", "trunc_sched",
-                     "meta_loss_with_aux_key", "use_bc_grads"))
+                     "meta_loss_with_aux_key", "use_bc_grads",
+                     "gradient_accumulation_steps"))
 @functools.partial(
-    jax.vmap, in_axes=(None, None, None, 0, 0, 0, 0, None, None, None, None))
+    jax.vmap, in_axes=(None, None, None, 0, 0, 0, 0, None, None, None, None, None))
 def truncated_unroll_one_step_vec_theta(
     task_family: tasks_base.TaskFamily,
     learned_opt: lopt_base.LearnedOptimizer,
@@ -440,6 +464,7 @@ def truncated_unroll_one_step_vec_theta(
     meta_loss_with_aux_key: Optional[str],
     override_num_steps: Optional[int],
     use_bc_grads: bool = False,
+    gradient_accumulation_steps: int = 1,
 ) -> Tuple[TruncatedUnrollState, truncated_step.TruncatedUnrollOut]:
   """Perform one step of inner training with vectorized theta."""
   return _truncated_unroll_one_step(
@@ -453,7 +478,8 @@ def truncated_unroll_one_step_vec_theta(
       outer_state=outer_state,
       meta_loss_with_aux_key=meta_loss_with_aux_key,
       override_num_steps=override_num_steps,
-      use_bc_grads=use_bc_grads)
+      use_bc_grads=use_bc_grads,
+      gradient_accumulation_steps=gradient_accumulation_steps)
 
 
 @gin.configurable
@@ -479,6 +505,7 @@ class VectorizedLOptTruncatedStep(truncated_step.VectorizedTruncatedStep,
       use_bc_grads: bool = False,
       random_initial_iteration_offset_linspace: bool = False,
       global_num_particles: int = 1,
+      gradient_accumulation_steps: int = 1,
   ):
     """Initializer.
 
@@ -516,6 +543,7 @@ class VectorizedLOptTruncatedStep(truncated_step.VectorizedTruncatedStep,
     self.timings = []
     self.use_bc_grads = use_bc_grads
     self.global_num_particles = global_num_particles
+    self.gradient_accumulation_steps = gradient_accumulation_steps
 
 
 
@@ -682,7 +710,8 @@ class VectorizedLOptTruncatedStep(truncated_step.VectorizedTruncatedStep,
     next_unroll_state_, ys = fn(self.task_family, self.learned_opt,
                                 self.trunc_sched, theta, vec_keys, unroll_state,
                                 tr_data, outer_state,
-                                self.meta_loss_with_aux_key, override_num_steps, self.use_bc_grads)
+                                self.meta_loss_with_aux_key, override_num_steps, self.use_bc_grads,
+                                self.gradient_accumulation_steps)
 
     # Should we evaluate resulting state on potentially new data?
     if meta_data is not None:
