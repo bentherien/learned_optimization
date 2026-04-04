@@ -338,6 +338,7 @@ class ESSingle(gradient_learner.GradientEstimator):
     self.update_truncation_length(0)
     self.samples_per_device = self.truncated_step.num_tasks
     self.use_bc_grads = use_bc_grads
+    self.std_schedule = std_schedule
 
     if pmap_across_devices:
       devices = mesh_utils.create_device_mesh((jax.device_count(),))
@@ -355,6 +356,12 @@ class ESSingle(gradient_learner.GradientEstimator):
       raise ValueError(
           "trunc_length must be an integer multiple of steps_per_jit. "
           f"Got trunc_length={trunc_length}, steps_per_jit={steps_per_jit}.")
+
+  def update_std(self, iteration):
+    """Update std from the optional schedule."""
+    if self.std_schedule is not None:
+      self.std = self.std_schedule(iteration)
+      # Also update the grad function if using sharded mode
 
   def task_name(self) -> str:
     return self.truncated_step.task_name()
