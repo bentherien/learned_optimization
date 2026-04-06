@@ -327,6 +327,7 @@ class ESSingle(gradient_learner.GradientEstimator):
       pmap_across_devices: bool = False,
       timer_obj: Any = None,
       use_bc_grads: bool = False,
+      std_schedule=None,
   ):
     self.truncated_step = truncated_step
     self.std = std
