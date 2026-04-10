@@ -70,6 +70,87 @@ class ESSingleWorkerState(gradient_learner.GradientEstimatorState):
   pos_state: TruncatedUnrollState
   neg_state: TruncatedUnrollState
   vec_pos: MetaParams  # Persistent perturbation — fixed per inner problem.
+  prev_delta_loss: jnp.ndarray  # [num_tasks] cross-window state for telescoping.
+
+
+# ---------------------------------------------------------------------------
+# Loss aggregation for different loss_type modes
+# ---------------------------------------------------------------------------
+
+def _aggregate_delta_losses(
+    delta_losses: jnp.ndarray,
+    mask: jnp.ndarray,
+    loss_type: str,
+    prev_delta_loss: jnp.ndarray,
+    final_loss_weight: float = 0.0,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  """Aggregate per-step delta losses into a per-task scalar for the ES gradient.
+
+  Supports multiple loss aggregation modes:
+    - "mean": Mean of per-step delta losses (original ES-Single behavior).
+    - "sum": Sum of per-step delta losses (no normalization).
+    - "final": Only the last valid timestep's delta loss.
+    - "telescoping": Cross-window telescoping sum targeting final loss. Each
+      window's contribution is the change in cumulative delta loss from the
+      previous window's end, so that across all windows of an inner problem
+      the gradient updates telescope to the true final-loss gradient.
+    - "weighted": Weighted blend of mean and final losses, controlled by
+      final_loss_weight (0 = pure mean, 1 = pure final).
+
+  Args:
+    delta_losses: [steps, num_tasks] per-step pos-neg loss differences.
+    mask: [steps, num_tasks] validity mask (1 for valid steps).
+    loss_type: Aggregation mode (static, for JIT branching).
+    prev_delta_loss: [num_tasks] previous window's cumulative final delta
+      (used only in "telescoping" mode).
+    final_loss_weight: Blending weight for "weighted" mode.
+
+  Returns:
+    (delta_loss, new_prev_delta_loss): Per-task scalar delta loss and updated
+      prev_delta_loss (only changes in "telescoping" mode).
+  """
+  num_tasks = delta_losses.shape[1]
+  denom = jnp.sum(mask, axis=0)  # [num_tasks]
+  task_indices = jnp.arange(num_tasks)
+
+  # Guard: clamp denom to >= 1 to avoid division by zero with all-zero masks.
+  safe_denom = jnp.maximum(denom, 1.0)
+
+  if loss_type == "mean":
+    delta_loss = jnp.sum(delta_losses * mask, axis=0) / safe_denom
+    return delta_loss, prev_delta_loss
+
+  elif loss_type == "sum":
+    delta_loss = jnp.sum(delta_losses * mask, axis=0)
+    return delta_loss, prev_delta_loss
+
+  elif loss_type == "final":
+    last_idx = jnp.maximum(denom.astype(jnp.int32) - 1, 0)  # [num_tasks]
+    delta_loss = delta_losses[last_idx, task_indices]
+    # Zero out tasks with no valid steps (all-zero mask).
+    delta_loss = jnp.where(denom > 0, delta_loss, 0.0)
+    return delta_loss, prev_delta_loss
+
+  elif loss_type == "telescoping":
+    # Cumulative delta at the end of this window.
+    last_idx = jnp.maximum(denom.astype(jnp.int32) - 1, 0)
+    current_final_delta = delta_losses[last_idx, task_indices]
+    # Zero out tasks with no valid steps.
+    current_final_delta = jnp.where(denom > 0, current_final_delta, 0.0)
+    # Window contribution = change from previous window's end.
+    delta_loss = current_final_delta - prev_delta_loss
+    return delta_loss, current_final_delta
+
+  elif loss_type == "weighted":
+    mean_dl = jnp.sum(delta_losses * mask, axis=0) / safe_denom
+    last_idx = jnp.maximum(denom.astype(jnp.int32) - 1, 0)
+    final_dl = delta_losses[last_idx, task_indices]
+    final_dl = jnp.where(denom > 0, final_dl, 0.0)
+    delta_loss = (1.0 - final_loss_weight) * mean_dl + final_loss_weight * final_dl
+    return delta_loss, prev_delta_loss
+
+  else:
+    raise ValueError(f"Unsupported loss_type: {loss_type!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +160,7 @@ class ESSingleWorkerState(gradient_learner.GradientEstimatorState):
 @functools.partial(
     jax.jit,
     static_argnames=("std", "timer_obj", "sign_delta_loss_scalar",
-                     "samples_per_device", "device_idx"))
+                     "samples_per_device", "device_idx", "loss_type"))
 def compute_es_single_grad(
     p_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
     n_yses: Sequence[truncated_step_mod.TruncatedUnrollOut],
@@ -89,15 +170,16 @@ def compute_es_single_grad(
     sign_delta_loss_scalar: Optional[float] = None,
     samples_per_device: Optional[int] = None,  # unused; kept for API parity
     device_idx: Optional[int] = None,           # unused; kept for API parity
+    loss_type: str = "mean",
+    prev_delta_loss: Optional[jnp.ndarray] = None,
+    final_loss_weight: float = 0.0,
 ) -> Tuple[float, MetaParams, truncated_step_mod.TruncatedUnrollOut,
-           jnp.ndarray]:
+           jnp.ndarray, jnp.ndarray]:
   """Compute ES-Single gradient estimate on a single machine.
 
   Gradient formula (per task t):
-      delta_loss_t = mean_over_steps( (p_loss - n_loss) * mask )
+      delta_loss_t = aggregate( (p_loss - n_loss) * mask )  [mode: loss_type]
       es_grad      = mean_over_tasks( vec_pos_t * delta_loss_t / (2 * std^2) )
-
-  No accumulator is maintained — each truncation window is independent.
 
   Args:
     p_yses: Sequence of TruncatedUnrollOut from the positive perturbation.
@@ -108,9 +190,13 @@ def compute_es_single_grad(
     sign_delta_loss_scalar: If set, replace delta_loss with its sign * scalar.
     samples_per_device: Unused in single-machine mode; present for API parity.
     device_idx: Unused in single-machine mode; present for API parity.
+    loss_type: Aggregation mode ("mean", "sum", "final", "telescoping",
+      "weighted"). Static for JIT.
+    prev_delta_loss: [num_tasks] previous window's cumulative delta (telescoping).
+    final_loss_weight: Blending weight for "weighted" mode.
 
   Returns:
-    (loss, es_grad, p_ys, delta_losses)
+    (loss, es_grad, p_ys, delta_losses, new_prev_delta_loss)
   """
   def flat_first(x):
     return x.reshape([x.shape[0] * x.shape[1]] + list(x.shape[2:]))
@@ -129,9 +215,9 @@ def compute_es_single_grad(
     delta_losses = (
         jnp.ones_like(delta_losses) * sign_per_task * sign_delta_loss_scalar)
 
-  # Average delta loss over the truncation window (mask out padding).
-  denom = jnp.sum(p_ys.mask, axis=0)  # [num_tasks]
-  delta_loss = jnp.sum(delta_losses * p_ys.mask, axis=0) / denom  # [num_tasks]
+  # Aggregate delta losses according to loss_type.
+  delta_loss, new_prev_delta_loss = _aggregate_delta_losses(
+      delta_losses, p_ys.mask, loss_type, prev_delta_loss, final_loss_weight)
 
   factor = 1.0 / (2 * std**2)
   num_tasks = delta_loss.shape[0]
@@ -143,11 +229,13 @@ def compute_es_single_grad(
       functools.partial(reshape_to, delta_loss), vec_pos)
   es_grad = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), vec_es_grad)
 
+  # Reporting loss: always use mean for consistent logging across loss_types.
+  denom = jnp.sum(p_ys.mask, axis=0)
   pos_loss = jnp.sum(p_ys.loss * p_ys.mask, axis=0) / denom
   neg_loss = jnp.sum(n_ys.loss * n_ys.mask, axis=0) / denom
   loss = jnp.mean((pos_loss + neg_loss) / 2.0)
 
-  return loss, es_grad, p_ys, delta_losses
+  return loss, es_grad, p_ys, delta_losses, new_prev_delta_loss
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +244,13 @@ def compute_es_single_grad(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("std", "sign_delta_loss_scalar", "replicated"))
+    static_argnames=("std", "sign_delta_loss_scalar", "replicated",
+                     "loss_type"))
 def _es_single_grad_sharded_inner(p_ys, n_ys, vec_pos, std,
-                                   sign_delta_loss_scalar, replicated):
+                                   sign_delta_loss_scalar, replicated,
+                                   loss_type="mean",
+                                   prev_delta_loss=None,
+                                   final_loss_weight=0.0):
   """JIT-compiled all-gather via sharding constraint, then ES-Single gradient."""
   # All-gather: replicate all sharded arrays across devices via constraint.
   p_ys = jax.tree_util.tree_map(
@@ -167,6 +259,7 @@ def _es_single_grad_sharded_inner(p_ys, n_ys, vec_pos, std,
       lambda x: lax.with_sharding_constraint(x, replicated), n_ys)
   vec_pos = jax.tree_util.tree_map(
       lambda x: lax.with_sharding_constraint(x, replicated), vec_pos)
+  prev_delta_loss = lax.with_sharding_constraint(prev_delta_loss, replicated)
 
   delta_losses = p_ys.loss - n_ys.loss
 
@@ -175,8 +268,9 @@ def _es_single_grad_sharded_inner(p_ys, n_ys, vec_pos, std,
     delta_losses = (
         jnp.ones_like(delta_losses) * sign_per_task * sign_delta_loss_scalar)
 
-  denom = jnp.sum(p_ys.mask, axis=0)
-  delta_loss = jnp.sum(delta_losses * p_ys.mask, axis=0) / denom
+  # Aggregate delta losses according to loss_type.
+  delta_loss, new_prev_delta_loss = _aggregate_delta_losses(
+      delta_losses, p_ys.mask, loss_type, prev_delta_loss, final_loss_weight)
 
   factor = 1.0 / (2 * std**2)
   num_tasks = delta_loss.shape[0]
@@ -188,11 +282,13 @@ def _es_single_grad_sharded_inner(p_ys, n_ys, vec_pos, std,
       functools.partial(reshape_to, delta_loss), vec_pos)
   es_grad = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), vec_es_grad)
 
+  # Reporting loss: always use mean for consistent logging.
+  denom = jnp.sum(p_ys.mask, axis=0)
   pos_loss = jnp.sum(p_ys.loss * p_ys.mask, axis=0) / denom
   neg_loss = jnp.sum(n_ys.loss * n_ys.mask, axis=0) / denom
   loss = jnp.mean((pos_loss + neg_loss) / 2.0)
 
-  return loss, es_grad, p_ys, delta_losses
+  return loss, es_grad, p_ys, delta_losses, new_prev_delta_loss
 
 
 def compute_es_single_grad_sharded(
@@ -205,8 +301,11 @@ def compute_es_single_grad_sharded(
     samples_per_device: int = 1,
     device_idx: int = 0,
     mesh: Optional[Mesh] = None,
+    loss_type: str = "mean",
+    prev_delta_loss: Optional[jnp.ndarray] = None,
+    final_loss_weight: float = 0.0,
 ) -> Tuple[float, MetaParams, truncated_step_mod.TruncatedUnrollOut,
-           jnp.ndarray]:
+           jnp.ndarray, jnp.ndarray]:
   """Compute ES-Single gradient using JAX mesh-based sharding for multi-GPU.
 
   Follows the same all-gather pattern as compute_pes_grad_sharded in
@@ -224,9 +323,12 @@ def compute_es_single_grad_sharded(
     samples_per_device: Number of tasks owned by this process.
     device_idx: Index of the current process (jax.process_index()).
     mesh: JAX Mesh created in ESSingle.__init__.
+    loss_type: Aggregation mode (see _aggregate_delta_losses).
+    prev_delta_loss: [local_tasks] previous window's cumulative delta.
+    final_loss_weight: Blending weight for "weighted" mode.
 
   Returns:
-    (loss, es_grad, p_ys, delta_losses) — same format as compute_es_single_grad.
+    (loss, es_grad, p_ys, delta_losses, new_prev_delta_loss)
   """
   def flat_first(x):
     return x.reshape([x.shape[0] * x.shape[1]] + list(x.shape[2:]))
@@ -267,13 +369,18 @@ def compute_es_single_grad_sharded(
     p_ys = jax.tree_util.tree_map(make_global_axis1, p_ys)
     n_ys = jax.tree_util.tree_map(make_global_axis1, n_ys)
     vec_pos = jax.tree_util.tree_map(make_global_axis0, vec_pos)
+    prev_delta_loss = make_global_axis0(prev_delta_loss)
 
-  loss, es_grad, p_ys_out, delta_losses = _es_single_grad_sharded_inner(
-      p_ys, n_ys, vec_pos,
-      std=std,
-      sign_delta_loss_scalar=sign_delta_loss_scalar,
-      replicated=replicated,
-  )
+  loss, es_grad, p_ys_out, delta_losses, new_prev_delta_loss = (
+      _es_single_grad_sharded_inner(
+          p_ys, n_ys, vec_pos,
+          std=std,
+          sign_delta_loss_scalar=sign_delta_loss_scalar,
+          replicated=replicated,
+          loss_type=loss_type,
+          prev_delta_loss=prev_delta_loss,
+          final_loss_weight=final_loss_weight,
+      ))
 
   # Slice back the per-device portion of per-task outputs.
   start_idx = device_idx * samples_per_device
@@ -283,8 +390,9 @@ def compute_es_single_grad_sharded(
       lambda x: x[:, start_idx:end_idx] if hasattr(x, 'shape') else x,
       p_ys_out)
   delta_losses = delta_losses[:, start_idx:end_idx]
+  new_prev_delta_loss = new_prev_delta_loss[start_idx:end_idx]
 
-  return loss, es_grad, p_ys_out, delta_losses
+  return loss, es_grad, p_ys_out, delta_losses, new_prev_delta_loss
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +423,8 @@ class ESSingle(gradient_learner.GradientEstimator):
   estimators are drop-in replaceable in meta_trainers.py.
   """
 
+  _VALID_LOSS_TYPES = ("mean", "sum", "final", "telescoping", "weighted")
+
   def __init__(
       self,
       truncated_step: truncated_step_mod.VectorizedTruncatedStep,
@@ -328,6 +438,8 @@ class ESSingle(gradient_learner.GradientEstimator):
       timer_obj: Any = None,
       use_bc_grads: bool = False,
       std_schedule=None,
+      loss_type: str = "mean",
+      final_loss_weight: float = 0.0,
   ):
     self.truncated_step = truncated_step
     self.std = std
@@ -340,6 +452,17 @@ class ESSingle(gradient_learner.GradientEstimator):
     self.samples_per_device = self.truncated_step.num_tasks
     self.use_bc_grads = use_bc_grads
     self.std_schedule = std_schedule
+    self.loss_type = loss_type
+    self.final_loss_weight = final_loss_weight
+
+    if loss_type not in self._VALID_LOSS_TYPES:
+      raise ValueError(
+          f"loss_type must be one of {self._VALID_LOSS_TYPES}, "
+          f"got {loss_type!r}")
+    if loss_type == "weighted" and not (0.0 <= final_loss_weight <= 1.0):
+      raise ValueError(
+          f"final_loss_weight must be in [0, 1] for 'weighted' loss_type, "
+          f"got {final_loss_weight}")
 
     if pmap_across_devices:
       devices = mesh_utils.create_device_mesh((jax.device_count(),))
@@ -381,7 +504,9 @@ class ESSingle(gradient_learner.GradientEstimator):
     return ESSingleWorkerState(
         pos_state=pos_unroll_state,
         neg_state=neg_unroll_state,
-        vec_pos=vec_pos)
+        vec_pos=vec_pos,
+        prev_delta_loss=jnp.zeros(
+            self.truncated_step.num_tasks, dtype=jnp.float32))
 
   def update_truncation_length(self, iteration):
     """Update trunc_length from the optional schedule."""
@@ -430,6 +555,7 @@ class ESSingle(gradient_learner.GradientEstimator):
       return jax.device_put(x, _local_dev)
 
     vec_pos = jax.tree_util.tree_map(_to_local, state.vec_pos)
+    prev_delta_loss = _to_local(state.prev_delta_loss)
     vec_p_theta = jax.tree_util.tree_map(lambda t, p: t + p, theta, vec_pos)
     vec_n_theta = jax.tree_util.tree_map(lambda t, p: t - p, theta, vec_pos)
 
@@ -484,8 +610,8 @@ class ESSingle(gradient_learner.GradientEstimator):
     else:
       mean_bc_grads = None
 
-    # ES-Single gradient: no accumulator passed or returned.
-    loss, es_grad, p_ys, delta_loss = self.grad_fn(
+    # ES-Single gradient with configurable loss aggregation.
+    loss, es_grad, p_ys, delta_loss, new_prev_delta_loss = self.grad_fn(
         p_yses,
         n_yses,
         vec_pos,
@@ -493,7 +619,10 @@ class ESSingle(gradient_learner.GradientEstimator):
         self.timer_obj,
         sign_delta_loss_scalar=self.sign_delta_loss_scalar,
         samples_per_device=self.samples_per_device,
-        device_idx=jax.process_index())
+        device_idx=jax.process_index(),
+        loss_type=self.loss_type,
+        prev_delta_loss=prev_delta_loss,
+        final_loss_weight=self.final_loss_weight)
 
     # Resample perturbations for tasks whose inner problem reset this window.
     # Tasks where is_done fired get fresh noise; others keep the same vec_pos.
@@ -514,6 +643,11 @@ class ESSingle(gradient_learner.GradientEstimator):
 
     updated_vec_pos = jax.tree_util.tree_map(_select, vec_pos, new_vec_pos)
 
+    # Pin new_prev_delta_loss to local device (may be globally-sharded after
+    # the sharded grad path) and reset to zero for tasks that reset.
+    new_prev_delta_loss = _to_local(new_prev_delta_loss)
+    updated_prev_delta_loss = jnp.where(did_reset, 0.0, new_prev_delta_loss)
+
     unroll_info = gradient_learner.UnrollInfo(
         loss=p_ys.loss,
         iteration=p_ys.iteration,
@@ -524,7 +658,8 @@ class ESSingle(gradient_learner.GradientEstimator):
         mean_loss=loss,
         grad=es_grad,
         bc_grad=mean_bc_grads,
-        unroll_state=ESSingleWorkerState(p_state, n_state, updated_vec_pos),
+        unroll_state=ESSingleWorkerState(
+            p_state, n_state, updated_vec_pos, updated_prev_delta_loss),
         unroll_info=unroll_info)
 
     metrics = summary.aggregate_metric_list(
