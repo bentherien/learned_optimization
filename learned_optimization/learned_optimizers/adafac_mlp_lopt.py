@@ -93,7 +93,10 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
                clip_norm=1.0,
                weight_decay=0.0,
                use_lo_cosine_scheduler=False,
-               step_mult_min=1e-4):
+               step_mult_min=1e-4,
+               init_lr=0.0,
+               warmup_fraction=0.05,
+               warmup_steps=0):
     super().__init__()
     self._exp_mult = exp_mult
     self._step_mult = step_mult
@@ -110,6 +113,9 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
     self.clip_grad = clip_grad
     self.clip_norm = clip_norm
     self.weight_decay = weight_decay
+    self.init_lr = init_lr
+    self.warmup_fraction = warmup_fraction
+    self.warmup_steps = warmup_steps
 
     self._mod_init, self._mod_apply = hk.without_apply_rng(
         hk.transform(self._mod))
@@ -323,7 +329,9 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
     step = direction * jnp.exp(magnitude * self._exp_mult)
     step = step.reshape(p.shape)
     # step = second_moment_normalizer(step, axis=axis)
-    new_p = p - (step + self.weight_decay * p) * scheduled_lr * self._step_mult
+    # scheduled_lr is the absolute learning rate (set in update_fn from
+    # init_lr/step_mult/step_mult_min), so apply it directly.
+    new_p = p - (step + self.weight_decay * p) * scheduled_lr
 
     if did_reshape:
       new_p = jnp.squeeze(new_p, 0)
@@ -472,11 +480,27 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
             "num_steps": opt_state.num_steps,
             "training_step_feature": training_step_feature,
         }
+        # scheduled_lr is the ABSOLUTE learning rate (post-warmup it is either
+        # constant step_mult or cosine_scheduler from step_mult → step_mult_min).
         scheduled_lr = lax.cond(
             self.use_lo_cosine_scheduler,
             lambda _: cosine_scheduler(opt_state.iteration, opt_state.num_steps, parent._step_mult, parent.step_mult_min),
-            lambda _: jnp.array(1.0),
+            lambda _: jnp.array(parent._step_mult, dtype=jnp.float32),
             None,
+        )
+        # Linear warmup: init_lr → step_mult over warmup_n steps. After warmup,
+        # the existing scheduled_lr (constant or cosine to step_mult_min) takes over.
+        if parent.warmup_fraction > 0:
+          warmup_n_raw = parent.warmup_fraction * opt_state.num_steps
+        else:
+          warmup_n_raw = parent.warmup_steps
+        warmup_n = jnp.maximum(jnp.asarray(warmup_n_raw, jnp.float32), 1.0)
+        warmup_lr = parent.init_lr + (parent._step_mult - parent.init_lr) * jnp.minimum(
+            opt_state.iteration.astype(jnp.float32) / warmup_n, 1.0)
+        scheduled_lr = jnp.where(
+            opt_state.iteration.astype(jnp.float32) < warmup_n,
+            warmup_lr,
+            scheduled_lr,
         )
         fun = functools.partial(mod_apply, self.theta["nn"], global_features, scheduled_lr)
 
