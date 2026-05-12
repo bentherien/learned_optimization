@@ -27,13 +27,13 @@ from learned_optimization.tasks import base
 from learned_optimization.tasks.datasets import image
 import ml_collections
 import numpy as onp
-from vision_transformer.vit_jax import models_vit
+from vit_jax import models_vit
 
 
 class VisionTransformerTask(base.Task):
   """Vision Transformer task."""
 
-  def __init__(self, cfg, datasets):
+  def __init__(self, datasets, cfg):
     num_c = datasets.extra_info["num_classes"]
     self.flax_module = models_vit.VisionTransformer(num_classes=num_c, **cfg)
     self.datasets = datasets

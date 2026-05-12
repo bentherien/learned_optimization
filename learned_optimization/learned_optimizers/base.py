@@ -53,6 +53,9 @@ class LearnedOptimizer(abc.ABC):
   def name(self):
     return None
 
+  def get_current_lr(self, iteration):
+    return 1.0
+
 
 Invertable = collections.namedtuple("Invertable", ["forward", "inverse"])
 one_minus_log = Invertable(

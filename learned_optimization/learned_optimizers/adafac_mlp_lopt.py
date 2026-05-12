@@ -29,7 +29,7 @@ from learned_optimization.learned_optimizers import base as lopt_base
 from learned_optimization.learned_optimizers import common
 from learned_optimization.optimizers import base as opt_base
 import numpy as onp
-
+import optax
 PRNGKey = jnp.ndarray
 
 
@@ -58,6 +58,7 @@ class AdafacMLPLOptState:
   fac_rolling_features: common.FactoredAccum
   num_steps: jnp.ndarray
   iteration: jnp.ndarray
+  scheduled_lr: jnp.ndarray
 
 
 def decay_to_param(x):
@@ -66,6 +67,11 @@ def decay_to_param(x):
 
 def param_to_decay(x):
   return 1 - jnp.exp(x * 10.)
+
+def cosine_scheduler(step, num_steps, lr_init, lr_final=0.0):
+        fraction = jnp.clip(step / (num_steps - 1), 0.0, 1.0)
+        cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * fraction))
+        return lr_final + (lr_init - lr_final) * cosine_decay
 
 
 @gin.configurable
@@ -82,7 +88,15 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
                initial_adafactor_decays=(0.9, 0.99, 0.999),
                concat_weights=True,
                make_separate_weights=False,
-               split_weights=False):
+               split_weights=False,
+               clip_grad=False,
+               clip_norm=1.0,
+               weight_decay=0.0,
+               use_lo_cosine_scheduler=False,
+               step_mult_min=1e-4,
+               init_lr=0.0,
+               warmup_fraction=0.05,
+               warmup_steps=0):
     super().__init__()
     self._exp_mult = exp_mult
     self._step_mult = step_mult
@@ -94,11 +108,19 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
     self._concat_weights = concat_weights
     self._make_separate_weights = make_separate_weights
     self._split_weights = split_weights
+    self.use_lo_cosine_scheduler = use_lo_cosine_scheduler
+    self.step_mult_min = step_mult_min
+    self.clip_grad = clip_grad
+    self.clip_norm = clip_norm
+    self.weight_decay = weight_decay
+    self.init_lr = init_lr
+    self.warmup_fraction = warmup_fraction
+    self.warmup_steps = warmup_steps
 
     self._mod_init, self._mod_apply = hk.without_apply_rng(
         hk.transform(self._mod))
 
-  def _mod(self, global_feat, p, g, m, rms, fac_g, fac_vec_col, fac_vec_row,
+  def _mod(self, global_feat, scheduled_lr, p, g, m, rms, fac_g, fac_vec_col, fac_vec_row,
            fac_vec_v):
     # this doesn't work with scalar parameters, so instead lets just reshape.
     if not p.shape:
@@ -244,6 +266,7 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
         net = o_tmp + jnp.broadcast_to(b, list(net.shape[0:-1]) + [w.shape[-1]])  # pytype: disable=attribute-error
 
         if wi != len(weights) - 1:
+          # net = jax.nn.tanh(net)
           net = jax.nn.relu(net)
 
       direction = net[..., 0]
@@ -292,14 +315,23 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
 
         # activation
         if wi != len(weights) - 1:
+          # inp = [jax.nn.tanh(x) for x in inp]
           inp = [jax.nn.relu(x) for x in inp]
 
       direction = inp[0]
       magnitude = inp[1]
 
-    step = direction * jnp.exp(magnitude * self._exp_mult) * self._step_mult
+    # direction = jnp.sign(direction)
+    # magnitude = jax.nn.relu(magnitude)
+    # step = direction * magnitude
+    # new_p = p - (step + self.weight_decay * p) * scheduled_lr * self._step_mult
+
+    step = direction * jnp.exp(magnitude * self._exp_mult)
     step = step.reshape(p.shape)
-    new_p = p - step
+    # step = second_moment_normalizer(step, axis=axis)
+    # scheduled_lr is the absolute learning rate (set in update_fn from
+    # init_lr/step_mult/step_mult_min), so apply it directly.
+    new_p = p - (step + self.weight_decay * p) * scheduled_lr
 
     if did_reshape:
       new_p = jnp.squeeze(new_p, 0)
@@ -344,12 +376,13 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
     fac_vec_row = jnp.ones([r, len(self._initial_adafactor_decays)])
     fac_vec_col = jnp.ones([c, len(self._initial_adafactor_decays)])
     fac_vec_v = jnp.ones([len(self._initial_adafactor_decays)])
-    mod_theta = self._mod_init(key, global_features, p, g, m, rms, fac_g,
+    scheduled_lr = jnp.array(1.0)
+    mod_theta = self._mod_init(key, global_features, scheduled_lr, p, g, m, rms, fac_g,
                                fac_vec_col, fac_vec_row, fac_vec_v)
     return hk.data_structures.to_haiku_dict({
-        "momentum_decays": jnp.zeros([len(self._initial_momentum_decays)]),
-        "rms_decays": jnp.zeros([len(self._initial_rms_decays)]),
-        "adafactor_decays": jnp.zeros([len(self._initial_adafactor_decays)]),
+        # "momentum_decays": jnp.zeros([len(self._initial_momentum_decays)]),
+        # "rms_decays": jnp.zeros([len(self._initial_rms_decays)]),
+        # "adafactor_decays": jnp.zeros([len(self._initial_adafactor_decays)]),
         "nn": mod_theta
     })
 
@@ -365,19 +398,29 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
 
       def __init__(self, theta):
         self.theta = theta
+        self.use_lo_cosine_scheduler = parent.use_lo_cosine_scheduler
 
-      def _get_rolling(self):
-        mom_decay = param_to_decay(
+      def _get_rolling(self, learned_accums=False):
+        if not learned_accums:
+          mom_decay = jnp.asarray(parent._initial_momentum_decays)
+        else:
+          mom_decay = param_to_decay(
             decay_to_param(jnp.asarray(parent._initial_momentum_decays)) +  # pylint: disable=protected-access
             self.theta["momentum_decays"])
         mom_roll = common.vec_rolling_mom(mom_decay)
 
-        rms_decay = param_to_decay(
+        if not learned_accums:
+          rms_decay = jnp.asarray(parent._initial_rms_decays)
+        else:
+          rms_decay = param_to_decay(
             decay_to_param(jnp.asarray(parent._initial_rms_decays)) +  # pylint: disable=protected-access
             self.theta["rms_decays"])
         rms_roll = common.vec_rolling_rms(rms_decay)
 
-        adafactor_decay = param_to_decay(
+        if not learned_accums:
+          adafactor_decay = jnp.asarray(parent._initial_adafactor_decays)
+        else:
+          adafactor_decay = param_to_decay(
             decay_to_param(jnp.asarray(parent._initial_adafactor_decays)) +  # pylint: disable=protected-access
             self.theta["adafactor_decays"])
         fac_vec_roll = common.vec_factored_rolling(adafactor_decay)
@@ -394,6 +437,7 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
           raise ValueError("Must specify number of steps for this lopt!")
 
         mom_roll, rms_roll, fac_vec_roll = self._get_rolling()
+        # mom_roll, rms_roll, fac_vec_roll = self._get_rolling(True)
 
         return AdafacMLPLOptState(
             params=params,
@@ -402,7 +446,8 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
             mom_rolling=mom_roll.init(params),
             fac_rolling_features=fac_vec_roll.init(params),
             iteration=jnp.asarray(0, dtype=jnp.int32),
-            num_steps=jnp.asarray(num_steps))
+            num_steps=jnp.asarray(num_steps),
+            scheduled_lr=jnp.asarray(1.0, dtype=jnp.float32))
 
       def update(
           self,  # pytype: disable=signature-mismatch  # overriding-parameter-count-checks
@@ -413,7 +458,15 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
           is_valid: bool = False,
           key: Optional[PRNGKey] = None,
       ) -> AdafacMLPLOptState:
+        if parent.clip_grad:
+          clip_norm = parent.clip_norm
+          clipping = optax.clip_by_global_norm(clip_norm)
+          # Apply gradient clipping
+          grad, _ = clipping.update(grad, None)
+        grad = jax.tree_util.tree_map(lambda x: jnp.nan_to_num(x), grad)
+        
         mom_roll, rms_roll, fac_vec_roll = self._get_rolling()
+        # mom_roll, rms_roll, fac_vec_roll = self._get_rolling(True)
         next_mom_rolling = mom_roll.update(opt_state.mom_rolling, grad)
         next_rms_rolling = rms_roll.update(opt_state.rms_rolling, grad)
         next_fac_rolling_features, fac_g = fac_vec_roll.update(
@@ -427,8 +480,29 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
             "num_steps": opt_state.num_steps,
             "training_step_feature": training_step_feature,
         }
-
-        fun = functools.partial(mod_apply, self.theta["nn"], global_features)
+        # scheduled_lr is the ABSOLUTE learning rate (post-warmup it is either
+        # constant step_mult or cosine_scheduler from step_mult → step_mult_min).
+        scheduled_lr = lax.cond(
+            self.use_lo_cosine_scheduler,
+            lambda _: cosine_scheduler(opt_state.iteration, opt_state.num_steps, parent._step_mult, parent.step_mult_min),
+            lambda _: jnp.array(parent._step_mult, dtype=jnp.float32),
+            None,
+        )
+        # Linear warmup: init_lr → step_mult over warmup_n steps. After warmup,
+        # the existing scheduled_lr (constant or cosine to step_mult_min) takes over.
+        if parent.warmup_fraction > 0:
+          warmup_n_raw = parent.warmup_fraction * opt_state.num_steps
+        else:
+          warmup_n_raw = parent.warmup_steps
+        warmup_n = jnp.maximum(jnp.asarray(warmup_n_raw, jnp.float32), 1.0)
+        warmup_lr = parent.init_lr + (parent._step_mult - parent.init_lr) * jnp.minimum(
+            opt_state.iteration.astype(jnp.float32) / warmup_n, 1.0)
+        scheduled_lr = jnp.where(
+            opt_state.iteration.astype(jnp.float32) < warmup_n,
+            warmup_lr,
+            scheduled_lr,
+        )
+        fun = functools.partial(mod_apply, self.theta["nn"], global_features, scheduled_lr)
 
         next_params = jax.tree_util.tree_map(fun, opt_state.params, grad,
                                              next_mom_rolling.m,
@@ -444,7 +518,8 @@ class AdafacMLPLOpt(lopt_base.LearnedOptimizer):
             fac_rolling_features=next_fac_rolling_features,
             iteration=opt_state.iteration + 1,
             state=model_state,
-            num_steps=opt_state.num_steps)
+            num_steps=opt_state.num_steps,
+            scheduled_lr=scheduled_lr)
 
         return tree_utils.match_type(next_opt_state, opt_state)
 

@@ -27,7 +27,7 @@ from learned_optimization.tasks import base
 from learned_optimization.tasks.datasets import image
 import ml_collections
 import numpy as onp
-from vision_transformer.vit_jax import models_mixer
+from vit_jax import models_mixer
 
 
 class MLPMixerTask(base.Task):

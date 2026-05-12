@@ -26,7 +26,7 @@ import jax.numpy as jnp
 from learned_optimization.research.data_driven import model_components  # pylint: disable=unused-import
 from learned_optimization.research.data_driven import transformer
 import optax
-from vision_transformer.vit_jax import models
+from vit_jax import models
 
 
 class Model(abc.ABC):

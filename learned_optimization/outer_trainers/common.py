@@ -125,13 +125,21 @@ def truncated_unroll(
         outer_state=outer_state,
         theta_is_vector=theta_is_vector,
         **extra_kwargs)
-    return state, outs
+    
+    # Extract bc_grad from state and include it in the outputs
+    bc_grad = state.bc_grad
+    # Create a tuple of outputs that includes both the original outs and bc_grad
+    combined_outputs = (outs, bc_grad)
+    
+    return state, combined_outputs
 
   key_and_data = jax.random.split(key, unroll_length), datas
   if wrap_step_fn is not None:
     step_fn = wrap_step_fn(step_fn)
-  state, ys = jax.lax.scan(step_fn, state, key_and_data)
-  return state, ys
+  
+  # The scan will now return state and a tuple of (ys, bc_grads)
+  state, (ys, bc_grads) = jax.lax.scan(step_fn, state, key_and_data)
+  return state, ys, bc_grads
 
 
 def maybe_stacked_es_unroll(
@@ -165,7 +173,7 @@ def maybe_stacked_es_unroll(
   # of tasks. Somehow assert this.
   if stack_antithetic_samples:
 
-    (pn_state, pn_ys), m = truncated_unroll(  # pylint: disable=unbalanced-tuple-unpacking,unexpected-keyword-arg,redundant-keyword-arg
+    (pn_state, pn_ys, bc_grads), m = truncated_unroll(  # pylint: disable=unbalanced-tuple-unpacking,unexpected-keyword-arg,redundant-keyword-arg
         *(static_args + [
             _stack(vec_p_theta, vec_n_theta),
             key,
@@ -178,15 +186,16 @@ def maybe_stacked_es_unroll(
         sample_rng_key=sample_rng_key)
     p_state, n_state = _split_tree(pn_state)
     p_ys, n_ys = _split_tree(pn_ys, axis=1)
+    p_bc_grads, n_bc_grads = _split_tree(bc_grads, axis=1)
   else:
-    (p_state, p_ys), m = truncated_unroll(  # pylint: disable=unbalanced-tuple-unpacking,unexpected-keyword-arg,redundant-keyword-arg
+    (p_state, p_ys, p_bc_grads), m = truncated_unroll(  # pylint: disable=unbalanced-tuple-unpacking,unexpected-keyword-arg,redundant-keyword-arg
         *(static_args +
           [vec_p_theta, key, p_state, datas, outer_state, override_num_steps]),
         with_summary=with_summary,
         sample_rng_key=sample_rng_key)
-    (n_state, n_ys), _ = truncated_unroll(  # pylint: disable=unbalanced-tuple-unpacking,unexpected-keyword-arg,redundant-keyword-arg
+    (n_state, n_ys, n_bc_grads), _ = truncated_unroll(  # pylint: disable=unbalanced-tuple-unpacking,unexpected-keyword-arg,redundant-keyword-arg
         *(static_args +
           [vec_n_theta, key, n_state, datas, outer_state, override_num_steps]),
         with_summary=False)
 
-  return p_state, n_state, p_ys, n_ys, m
+  return p_state, n_state, p_ys, n_ys, p_bc_grads, n_bc_grads, m
