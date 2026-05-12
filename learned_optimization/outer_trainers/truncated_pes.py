@@ -40,6 +40,23 @@ MetaParams = Any
 TruncatedUnrollState = Any
 
 
+def _delta_loss_snr(delta_losses, mask):
+  """Mask-weighted SNR of delta_losses over [steps, num_tasks].
+
+  Returns mean(|Δℓ|·m) / std(Δℓ·m), with mask=0 entries zeroed-out so upstream
+  NaNs there cannot pollute the estimate. Antithetic-safe: uses |Δℓ| in the
+  numerator instead of the (near-zero) raw mean.
+  """
+  m = mask.astype(jnp.float32)
+  dl = jnp.where(m > 0, delta_losses, jnp.float32(0.0)).astype(jnp.float32)
+  denom = jnp.maximum(jnp.sum(m), jnp.float32(1.0))
+  abs_mean = jnp.sum(jnp.abs(dl)) / denom
+  mean = jnp.sum(dl) / denom
+  var = jnp.sum(jnp.square(dl - mean) * m) / denom
+  std = jnp.sqrt(var + jnp.float32(1e-12))
+  return abs_mean / (std + jnp.float32(1e-12))
+
+
 @flax.struct.dataclass
 class PESWorkerState(gradient_learner.GradientEstimatorState):
   pos_state: TruncatedUnrollState
@@ -292,6 +309,8 @@ def _pes_grad_sharded_inner(p_ys, n_ys, accumulator, vec_pos, std,
     delta_losses = jnp.ones_like(
         delta_losses) * sign_per_task * sign_delta_loss_scalar
 
+  snr_delta_loss = _delta_loss_snr(delta_losses, p_ys.mask)
+
   has_finished = lax.cumsum(jnp.asarray(p_ys.is_done, dtype=jnp.int32)) > 0
 
   denom = jnp.sum(p_ys.mask, axis=0)
@@ -341,6 +360,7 @@ def _pes_grad_sharded_inner(p_ys, n_ys, accumulator, vec_pos, std,
       new_accumulator,
       p_ys,
       delta_losses,
+      snr_delta_loss,
   )
 
 
@@ -436,7 +456,8 @@ def compute_pes_grad_sharded(
         [_to_single_device(baseline_losses)])
 
   # JIT-compiled all-gather + PES gradient computation
-  loss, b_loss, es_grad, new_accumulator, p_ys_out, delta_losses = (
+  (loss, b_loss, es_grad, new_accumulator, p_ys_out, delta_losses,
+   snr_delta_loss) = (
       _pes_grad_sharded_inner(
           p_ys, n_ys, accumulator, vec_pos,
           std=std,
@@ -467,6 +488,7 @@ def compute_pes_grad_sharded(
       new_accumulator,
       p_ys_out,
       delta_losses,
+      snr_delta_loss,
   )
 
 
@@ -541,6 +563,8 @@ def compute_pes_grad(
     delta_losses = jnp.ones_like(
         delta_losses) * sign_per_task * sign_delta_loss_scalar
 
+  snr_delta_loss = _delta_loss_snr(delta_losses, p_ys.mask)
+
   has_finished = lax.cumsum(jnp.asarray(p_ys.is_done, dtype=jnp.int32)) > 0
 
   # p_ys is of the form [sequence, n_tasks]
@@ -589,6 +613,7 @@ def compute_pes_grad(
       new_accumulator,
       p_ys,
       delta_losses,
+      snr_delta_loss,
   )  # pytype: disable=bad-return-type
 
 @gin.configurable
@@ -771,7 +796,8 @@ class TruncatedPES(gradient_learner.GradientEstimator):
       mean_bc_grads = None
 
 
-    loss, b_loss, es_grad, new_accumulator, p_ys, delta_loss = self.grad_fn(
+    (loss, b_loss, es_grad, new_accumulator, p_ys, delta_loss,
+     snr_delta_loss) = self.grad_fn(
         p_yses,
         n_yses,
         accumulator,
@@ -798,6 +824,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
 
     metrics = summary.aggregate_metric_list(
         metrics, use_jnp=jax_utils.in_jit(), key=next(rng))
+    metrics["mean||snr_delta_loss"] = snr_delta_loss
     if with_summary:
       # metrics["sample||delta_loss_sample"] = summary.sample_value(
       #     key, jnp.abs(delta_loss))
